@@ -1,0 +1,165 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/projects/autobuilder/PRD-agentic-memory.md",
+  "intent_slug": "recall-memory-linter",
+  "root_motivation": "Today's flat MEMORY.md store has no decay signal, no duplicate detection, and no link integrity check, so stale or contradictory notes silently mislead future sessions. Before building retrieval, embeddings, or push-mode, prove the file layout is healthy: a deterministic linter that walks the Markdown memory store and reports stale, duplicate, and broken-link entries gives the user (and Claude) a trusted hygiene baseline to iterate retrieval against. This V1 slice does not retrieve, rank, or write memories; it only audits the on-disk corpus so later phases stand on a clean foundation.",
+  "user_persona": "Single user (jsy) on one laptop running Claude Code, plus the Claude sessions that read/write ~/.claude/recall/. Linter is invoked manually from a shell or by a scheduled hook; output is consumed by humans reading the terminal and by tooling parsing JSON.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing",
+    "lower_is_better": false,
+    "harness_command": "cargo test --manifest-path crates/recall-memory-linter/Cargo.toml --tests -- --format=terse 2>&1 | grep -cE '^test .* \\.\\.\\. ok$'",
+    "target": null
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "CLI binary `recall-lint` accepts a positional path to a memory root directory and exits 0 when the directory is empty, emitting an empty findings array in JSON mode.",
+      "test": "tests/acceptance_ac1.rs"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "Walks the root recursively, treats every *.md file as a memory entry, and ignores non-Markdown files and dot-prefixed directories.",
+      "test": "tests/acceptance_ac2.rs"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "Parses YAML frontmatter (optional, fenced by ---). Recognizes `last_recalled_at` and `created_at` as RFC3339 timestamps; flags entries whose newest of (last_recalled_at, created_at, file mtime) is older than --stale-days (default 30) as finding kind=`stale`.",
+      "test": "tests/acceptance_ac3.rs"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "Detects duplicates: two entries with byte-identical body (post-frontmatter, trimmed) produce one finding kind=`duplicate` listing all paths in deterministic sorted order.",
+      "test": "tests/acceptance_ac4.rs"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "Detects broken `[[wiki-links]]`: a link `[[target]]` resolves if any *.md file under the root has stem `target` or relative path `target.md`; otherwise emits finding kind=`broken_link` with source path, target, and 1-indexed line number.",
+      "test": "tests/acceptance_ac5.rs"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "Output mode is selectable: `--format text` (default, human-readable, grouped by kind) or `--format json` (stable schema with top-level `findings` array; each finding has `kind`, `paths`, and kind-specific fields). JSON output is deterministic given fixed input.",
+      "test": "tests/acceptance_ac6.rs"
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "Exit code reflects findings: 0 = no findings, 1 = at least one finding, 2 = invocation error (bad path, unreadable file, malformed args). Exit codes are stable across runs on identical inputs.",
+      "test": "tests/acceptance_ac7.rs"
+    },
+    {
+      "id": "AC8",
+      "level": "SHOULD",
+      "description": "Lints a fixture corpus of 100 *.md files in under 500ms wall time on a warm cache (single-thread). Verified by a `#[ignore]`-gated bench-style test that asserts elapsed < 500ms.",
+      "test": "tests/acceptance_ac8.rs"
+    },
+    {
+      "id": "AC9",
+      "level": "SHOULD",
+      "description": "Frontmatter is optional; entries without frontmatter use file mtime as the freshness signal and are never flagged as `stale` solely because frontmatter is absent.",
+      "test": "tests/acceptance_ac9.rs"
+    },
+    {
+      "id": "AC10",
+      "level": "MAY",
+      "description": "Supports `--ignore <glob>` (repeatable) to skip paths matching the glob; ignored files contribute neither to duplicate detection nor to wiki-link resolution.",
+      "test": "tests/acceptance_ac10.rs"
+    }
+  ],
+  "scope": [
+    "Rust 2024 CLI crate `recall-memory-linter` producing a `recall-lint` binary.",
+    "Recursive walk of a memory-root directory; treat *.md files as entries.",
+    "YAML frontmatter parsing for `last_recalled_at` and `created_at` fields only.",
+    "Three lint kinds: stale (age threshold), duplicate (body-identical), broken_link (unresolved [[wiki-link]]).",
+    "Two output formats: human-readable text and stable JSON.",
+    "Deterministic output ordering (sorted paths, sorted findings by kind then path).",
+    "Exit codes mapping (0/1/2) suitable for shell pipelines and pre-commit hooks.",
+    "Unit and acceptance tests using fixture corpora committed under tests/fixtures/."
+  ],
+  "non_goals": [
+    "No retrieval, ranking, or top-k query API.",
+    "No embeddings, vector index, FTS5, or SQLite anywhere.",
+    "No reading from or writing to ~/.claude/recall/ at runtime; path is user-supplied.",
+    "No memory writes, edits, or auto-fix; linter is read-only.",
+    "No daemon, no Unix socket, no MCP server, no Claude Code hook integration.",
+    "No PostToolUse observation, no SessionStart injection, no Stop-hook promotion.",
+    "No episodic/semantic/procedural/reflective typing — all *.md files are treated uniformly.",
+    "No confidence scoring, no recall_count tracking, no supersedes chain handling.",
+    "No within-session scratch handling, no compaction-survival logic.",
+    "No cross-project boosting or project-tagging logic.",
+    "No network calls of any kind; no telemetry.",
+    "No GUI, no TUI, no web UI; CLI only.",
+    "Not a general-purpose Markdown linter — only the three kinds listed in scope."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 15,
+    "additional": {
+      "no_network_at_runtime": true,
+      "deterministic_output": true,
+      "single_binary": true
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why build a memory linter as the V1 slice of recall, rather than retrieval or embeddings?",
+      "a": "The PRD names stale, duplicate, and unaudited memories as the proximate harm — 'a note saved on 2026-01-15 has the same weight today as a note from yesterday' and 'stale memories actively mislead me.' Retrieval that surfaces bad data is worse than no retrieval, so hygiene must come first."
+    },
+    {
+      "why": 2,
+      "q": "Why must hygiene come before retrieval rather than in parallel?",
+      "a": "Retrieval ranking is impossible to evaluate without a clean ground-truth corpus. If the store contains duplicates and broken links, ranking metrics measure noise. The linter produces the corpus signal that downstream phases need."
+    },
+    {
+      "why": 3,
+      "q": "Why a CLI linter specifically, instead of a library called from the future daemon?",
+      "a": "A CLI has the smallest surface area that still delivers value today: the user can run it against the existing ~/.claude flat-Markdown store in week 1, get a hygiene report, and act on it. A library with no callers is dead code; a CLI is immediately exercised, and the same logic can later be lifted into a library."
+    },
+    {
+      "why": 4,
+      "q": "Why must the output be deterministic and exit-coded?",
+      "a": "Determinism makes the linter testable under autobuilder's iterate-and-prove loop (golden fixtures), and stable exit codes let the user wire it into pre-commit or scheduled hooks without parsing text. Both properties are load-bearing for the iteration harness to compare runs."
+    },
+    {
+      "why": 5,
+      "q": "Why these three lint kinds (stale, duplicate, broken_link) and not more?",
+      "a": "These are the three failure modes the PRD names explicitly as currently-broken (sections 1.4, 7-architecture wiki-link layout, and the implicit duplicate-risk in a flat namespace). Anything else (confidence calibration, evidence-excerpt verification, supersedes-chain validation) requires schemas the V1 file layout has not yet committed to, so linting them now would over-fit a guess."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "User was not available for live 5-Whys; what is the V1 carve from a multi-phase PRD?",
+      "resolution": "Inferred from PRD Phase 0/1 ('Migrate existing memory layout, no behavior change' and 'File store + keyword index') and from risk 'Memory becomes a leash' — the smallest valuable slice is a read-only hygiene auditor. Deferred everything in phases 2-5 to non_goals."
+    },
+    {
+      "question": "Should the linter consume ~/.claude/recall/ directly, or accept an arbitrary path?",
+      "resolution": "Arbitrary path. Avoids tight coupling to a layout the PRD itself calls 'open question 1' (separate repo vs ~/.claude/), keeps tests hermetic via fixtures, and lets the user dry-run against any directory."
+    },
+    {
+      "question": "What counts as 'stale'? PRD mentions 30d as decays_after example but it is a per-memory field, not a global default.",
+      "resolution": "Default --stale-days=30, configurable. Linter uses max(frontmatter.last_recalled_at, frontmatter.created_at, file mtime) as the freshness signal. If frontmatter omits both timestamps, file mtime alone is used and absence-of-frontmatter alone is not a stale signal."
+    },
+    {
+      "question": "PRD shows a JSON memory schema with id/kind/subject/etc. Should the linter validate that schema?",
+      "resolution": "No. V1 file layout has not been committed (PRD section 7 is illustrative, not normative). Schema validation is deferred to a future phase once the layout is canonical."
+    },
+    {
+      "question": "What is the canonical wiki-link syntax — [[name]], [[name.md]], [[path/to/name]]?",
+      "resolution": "Accept [[target]] where target is matched against (a) any *.md file's stem under root, or (b) relative path target.md from root. Both forms resolve; anything else is a broken link."
+    },
+    {
+      "question": "Harness command for the unfakeable metric — should it be cargo test count or a custom binary?",
+      "resolution": "Use cargo test exit-status counted via grep on 'test ... ok' lines. Total tests passing is the single load-bearing scalar; iterate-and-prove maximizes it. Future phases can swap in latency/binary-size when those become load-bearing."
+    }
+  ],
+  "created_at": "2026-05-22T12:00:00Z"
+}
