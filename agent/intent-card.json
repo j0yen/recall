@@ -5,7 +5,7 @@
   "root_motivation": "Today's flat MEMORY.md store has no decay signal, no duplicate detection, and no link integrity check, so stale or contradictory notes silently mislead future sessions. Before building retrieval, embeddings, or push-mode, prove the file layout is healthy: a deterministic linter that walks the Markdown memory store and reports stale, duplicate, and broken-link entries gives the user (and Claude) a trusted hygiene baseline to iterate retrieval against. This V1 slice does not retrieve, rank, or write memories; it only audits the on-disk corpus so later phases stand on a clean foundation.",
   "user_persona": "Single user (jsy) on one laptop running Claude Code, plus the Claude sessions that read/write ~/.claude/recall/. Linter is invoked manually from a shell or by a scheduled hook; output is consumed by humans reading the terminal and by tooling parsing JSON.",
   "unfakeable_metric": {
-    "name": "acceptance_tests_passing",
+    "name": "acceptance_tests_passing_count",
     "lower_is_better": false,
     "harness_command": "cargo test --manifest-path crates/recall-memory-linter/Cargo.toml --tests -- --format=terse 2>&1 | grep -cE '^test .* \\.\\.\\. ok$'",
     "target": null
