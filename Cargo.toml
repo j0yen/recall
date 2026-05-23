@@ -1,10 +1,20 @@
 [package]
-name = "recall-fastembed-embedder"
-version = "0.1.0"
+name = "recall"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
+description = "Local-first agentic memory: file-backed memories with a keyword/FTS5 index and an in-process semantic embedder."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/j0yen/wintermute"
 publish = false
+
+[[bin]]
+name = "recall"
+path = "src/main.rs"
+
+[lib]
+name = "recall"
+path = "src/lib.rs"
 
 [lints.rust]
 unsafe_code = "deny"
@@ -53,6 +63,19 @@ strip = "debuginfo"
 panic = "abort"
 
 [dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+directories = "5"
+fastembed = "4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+ulid = { version = "1.1", features = ["serde"] }
+walkdir = "2"
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
