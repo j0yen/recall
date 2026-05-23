@@ -7,10 +7,48 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac3() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC3 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    // Old entry: frontmatter timestamps are old; we also touch -d the mtime so
+    // it doesn't override (freshness = max of last_recalled_at, created_at, mtime).
+    let old_path = root.path().join("old.md");
+    fs::write(
+        &old_path,
+        "---\ncreated_at: 2025-01-01T00:00:00Z\nlast_recalled_at: 2025-01-01T00:00:00Z\n---\nold body\n",
+    )
+    .unwrap();
+    let touch = Command::new("touch")
+        .args(["-d", "2025-01-01T00:00:00Z"])
+        .arg(&old_path)
+        .output()
+        .unwrap();
+    assert!(touch.status.success(), "touch -d failed: {touch:?}");
+
+    // Fresh entry: created_at today; mtime fresh-by-default.
+    let today = chrono::Utc::now().to_rfc3339();
+    fs::write(
+        root.path().join("fresh.md"),
+        format!("---\ncreated_at: {today}\nlast_recalled_at: {today}\n---\nfresh body\n"),
+    )
+    .unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "30"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    let stale: Vec<&serde_json::Value> = findings.iter().filter(|f| f["kind"] == "stale").collect();
+    assert_eq!(stale.len(), 1, "exactly 1 stale entry expected: {findings:?}");
+    let path = stale[0]["path"].as_str().unwrap();
+    assert!(path.ends_with("old.md"));
 }

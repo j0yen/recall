@@ -7,10 +7,51 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac6() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC6 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("a.md"), "---\n---\nsame\n").unwrap();
+    fs::write(root.path().join("b.md"), "---\n---\nsame\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+
+    // Text default.
+    let out_text = Command::new(bin)
+        .arg(root.path())
+        .args(["--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let stdout_text = String::from_utf8(out_text.stdout.clone()).unwrap();
+    assert!(stdout_text.contains("duplicate"));
+
+    // Explicit text equals default.
+    let out_text2 = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "text", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    assert_eq!(out_text.stdout, out_text2.stdout);
+
+    // JSON deterministic.
+    let json_a = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap()
+        .stdout;
+    let json_b = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert_eq!(json_a, json_b, "JSON output must be byte-identical");
+    let parsed: serde_json::Value = serde_json::from_slice(&json_a).unwrap();
+    assert!(parsed["findings"].is_array());
 }

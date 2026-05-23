@@ -7,10 +7,47 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac10() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC10 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("kept.md"), "---\n---\nthe body\n").unwrap();
+    fs::write(root.path().join("dropme.md"), "---\n---\nthe body\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+
+    // Without --ignore: duplicate detected.
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let dups: Vec<&serde_json::Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "duplicate")
+        .collect();
+    assert_eq!(dups.len(), 1, "without --ignore, duplicate present");
+
+    // With --ignore 'dropme.md': no duplicate.
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500", "--ignore", "dropme.md"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let dups: Vec<&serde_json::Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "duplicate")
+        .collect();
+    assert!(dups.is_empty(), "with --ignore, duplicate must NOT be reported");
 }

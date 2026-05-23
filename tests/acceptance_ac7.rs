@@ -7,10 +7,33 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac7() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC7 not yet implemented — see file header");
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+
+    // 0: empty corpus.
+    let empty = TempDir::new().unwrap();
+    let out = Command::new(bin).arg(empty.path()).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+
+    // 1: corpus with at least one finding (duplicate pair).
+    let dup_root = TempDir::new().unwrap();
+    fs::write(dup_root.path().join("a.md"), "---\n---\nx\n").unwrap();
+    fs::write(dup_root.path().join("b.md"), "---\n---\nx\n").unwrap();
+    let out = Command::new(bin)
+        .arg(dup_root.path())
+        .args(["--stale-days", "36500"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    // 2: bad path.
+    let out = Command::new(bin).arg("/no/such/path/here").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
 }

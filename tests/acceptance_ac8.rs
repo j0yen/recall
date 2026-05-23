@@ -7,10 +7,41 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use std::time::Instant;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac8() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC8 not yet implemented — see file header");
+    // Run the perf check as a regular test (not ignored) because the corpus
+    // size is small enough; ignored mode is a documented alternative.
+    let root = TempDir::new().unwrap();
+    for i in 0..100u32 {
+        let body = format!("---\n---\nline {i} body content here\n");
+        fs::write(root.path().join(format!("m{i:03}.md")), body).unwrap();
+    }
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    // Warm the binary cache with one preflight run.
+    let _ = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+
+    let start = Instant::now();
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(out.status.success() || out.status.code() == Some(1));
+    assert!(
+        elapsed.as_millis() < 500,
+        "100-file lint took {elapsed:?}, expected < 500ms"
+    );
 }

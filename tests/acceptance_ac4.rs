@@ -7,10 +7,42 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac4() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC4 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    // Three files: two with byte-identical body (modulo trailing \n), one unique.
+    fs::write(root.path().join("a.md"), "---\n---\nthe body\n").unwrap();
+    fs::write(root.path().join("b.md"), "---\n---\nthe body").unwrap(); // no trailing \n
+    fs::write(root.path().join("c.md"), "---\n---\ndifferent\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let dups: Vec<&serde_json::Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "duplicate")
+        .collect();
+    assert_eq!(dups.len(), 1, "exactly 1 duplicate finding expected");
+    let paths: Vec<&str> = dups[0]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(paths.len(), 2);
+    // Deterministic sorted order: a.md before b.md.
+    assert!(paths[0].ends_with("a.md"));
+    assert!(paths[1].ends_with("b.md"));
 }

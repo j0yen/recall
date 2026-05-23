@@ -7,10 +7,22 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac1() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC1 not yet implemented — see file header");
+    let dir = TempDir::new().unwrap();
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    let out = Command::new(bin)
+        .arg(dir.path())
+        .args(["--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert!(json["findings"].as_array().unwrap().is_empty());
 }

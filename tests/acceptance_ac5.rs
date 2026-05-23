@@ -7,10 +7,40 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac5() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC5 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    // index.md has 2 wiki-links: one resolves, one is broken.
+    fs::write(
+        root.path().join("index.md"),
+        "---\n---\nfirst line\nsee [[exists]] and [[missing]] in this list\n",
+    )
+    .unwrap();
+    fs::write(root.path().join("exists.md"), "---\n---\nI exist\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap();
+    let broken: Vec<&serde_json::Value> = json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "broken_link")
+        .collect();
+    assert_eq!(broken.len(), 1, "exactly 1 broken link: {:?}", json["findings"]);
+    let entry = broken[0];
+    assert_eq!(entry["target"], "missing");
+    assert_eq!(entry["line"], 2, "1-indexed line number (body line 2): {entry:?}");
+    let path = entry["path"].as_str().unwrap();
+    assert!(path.ends_with("index.md"));
 }

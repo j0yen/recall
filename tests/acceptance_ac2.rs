@@ -7,10 +7,48 @@
 //! READ-ONLY after scaffold. To change an AC, file
 //! agent/intent_card_amendment_request.json and re-scaffold.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+
+use std::fs;
+use std::process::Command;
+use tempfile::TempDir;
+
 #[test]
 fn acceptance_ac2() {
-    // TODO(edit-agent): implement the test body that verifies the
-    // AC description above. Until implemented, this test fails so the
-    // iterate-and-prove loop sees a real signal.
-    panic!("AC AC2 not yet implemented — see file header");
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join("a.md"), "---\n---\nbody a\n").unwrap();
+    fs::create_dir_all(root.path().join("sub")).unwrap();
+    fs::write(root.path().join("sub/b.md"), "---\n---\nbody b\n").unwrap();
+    fs::write(root.path().join("note.txt"), "ignore me").unwrap();
+    fs::create_dir_all(root.path().join(".hidden")).unwrap();
+    fs::write(root.path().join(".hidden/c.md"), "---\n---\nshould be skipped\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_recall-lint");
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    // The non-empty fresh corpus shouldn't crash. Exit 0 (no findings) since stale-days is huge.
+    assert_eq!(out.status.code(), Some(0));
+
+    // Hand-roll a duplicate to verify both .md files are seen, and .hidden + .txt are not.
+    fs::write(root.path().join("d1.md"), "---\n---\nsame body\n").unwrap();
+    fs::write(root.path().join("d2.md"), "---\n---\nsame body\n").unwrap();
+    let out = Command::new(bin)
+        .arg(root.path())
+        .args(["--format", "json", "--stale-days", "36500"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let findings = json["findings"].as_array().unwrap();
+    let dup = findings.iter().find(|f| f["kind"] == "duplicate").unwrap();
+    let paths: Vec<String> = dup["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths.len(), 2, "expected 2 duplicates only (hidden + txt excluded)");
 }
