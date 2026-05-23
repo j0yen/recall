@@ -1,0 +1,129 @@
+{
+  "schema": "autobuilder.intent_card.v1",
+  "prd_source": "/home/jsy/projects/autobuilder/PRD-agentic-memory.md",
+  "intent_slug": "recall-fastembed-embedder",
+  "created_at": "2026-05-23T09:15:00Z",
+  "root_motivation": "v0.1's HashEmbedder is non-semantic by design — it catches morphological variation but misses true synonyms and paraphrases. Two live consumers (SessionStart hook + /self-review Phase 0) use --hybrid retrieval, and reflective-memory compounding across sessions depends on semantic similarity surfacing prior notes when this session's wording differs. With a placeholder embedder the hybrid leaderboard collapses to pure FTS5 for cross-vocabulary matches and the compounding loop silently degrades. The load-bearing v0.2 change — separable from the 4b.1-4b.5 CLI sand-the-edges items — is graduating embeddings to a real in-process model (fastembed-rs + BGE-small-en-v1.5), no daemon, no Ollama, no breakage of the v0.1 file/frontmatter format. CLI gaps go to a follow-up slice.",
+  "user_persona": "Every Claude Code session running on jsy's laptop, plus jsy when inspecting memory. The binary is invoked from shells, from SessionStart hooks, and from the /self-review skill. The user wants memories about the same concept written in different words to surface for each other.",
+  "unfakeable_metric": {
+    "name": "acceptance_tests_passing_count",
+    "lower_is_better": false,
+    "harness_command": "cargo test --tests -- --format=terse 2>&1 | grep -cE '^test .* \\.\\.\\. ok$'",
+    "target": null
+  },
+  "acceptance_criteria": [
+    {
+      "id": "AC1",
+      "level": "MUST",
+      "description": "Cargo.toml depends on `fastembed` (any 4.x or 5.x), pinned with a tilde or caret range, and the workspace builds clean.",
+      "test": "tests/acceptance_ac1.rs"
+    },
+    {
+      "id": "AC2",
+      "level": "MUST",
+      "description": "A `FastembedEmbedder` type implements the existing `Embedder` trait. Its constructor lazy-fetches BGE-small-en-v1.5 into `~/.cache/fastembed/` on first use; subsequent constructions reuse the cache.",
+      "test": "tests/acceptance_ac2.rs"
+    },
+    {
+      "id": "AC3",
+      "level": "MUST",
+      "description": "FastembedEmbedder reports `embedding_id = \"fastembed:bge-small-en-v1.5\"` and `embedding_dim = 384` (BGE-small's actual dimensionality). HashEmbedder continues to report its own id and 256-dim.",
+      "test": "tests/acceptance_ac3.rs"
+    },
+    {
+      "id": "AC4",
+      "level": "MUST",
+      "description": "CLI accepts `--embedder hash|fastembed`. When the flag is absent, the default is `fastembed`. `hash` remains selectable for offline/test contexts.",
+      "test": "tests/acceptance_ac4.rs"
+    },
+    {
+      "id": "AC5",
+      "level": "MUST",
+      "description": "Semantic discrimination: given two memories — one about \"package manager preferences\" and one about \"unrelated text\" — a hybrid query for the synonym phrase \"dependency tool\" ranks the package-manager memory above the unrelated one with FastembedEmbedder. The same query with HashEmbedder produces the inverse or null ranking (test asserts the difference).",
+      "test": "tests/acceptance_ac5.rs"
+    },
+    {
+      "id": "AC6",
+      "level": "MUST",
+      "description": "`recall reindex` regenerates the vector column using whichever embedder is active. After switching `--embedder hash` → `--embedder fastembed` and running reindex, the vector column reflects 384-dim FastembedEmbedder embeddings (verified via SQL count of bytes per row).",
+      "test": "tests/acceptance_ac6.rs"
+    },
+    {
+      "id": "AC7",
+      "level": "MUST",
+      "description": "File layout and YAML frontmatter remain byte-compatible with v0.1. A v0.1 memory file (provided as a fixture) round-trips through v0.2 read → write → read with zero byte differences in the frontmatter.",
+      "test": "tests/acceptance_ac7.rs"
+    },
+    {
+      "id": "AC8",
+      "level": "SHOULD",
+      "description": "First fastembed query in a fresh process with the model already cached completes within 2s wall time on this laptop (cold cache; second query <100ms).",
+      "test": "tests/acceptance_ac8.rs"
+    }
+  ],
+  "scope": [
+    "Add FastembedEmbedder as a new Embedder impl in src/embeddings.rs.",
+    "Make fastembed the default; keep HashEmbedder selectable via --embedder hash.",
+    "Wire the embedding_id and embedding_dim columns to reflect the active embedder.",
+    "Keep the v0.1 file layout and YAML frontmatter byte-compatible.",
+    "Update `recall reindex` to regenerate vectors under whichever embedder is active."
+  ],
+  "non_goals": [
+    "No daemon mode and no Ollama/HTTP sidecar — embeddings live in-process.",
+    "No PostToolUse turn-by-turn push retrieval (deferred to a later phase).",
+    "No Stop-hook scratch promotion.",
+    "No removal of HashEmbedder — it stays for offline/test contexts.",
+    "No fixing of 4b.1-4b.5 CLI gaps (symmetric --subject on query, JSON everywhere, touch, update, gc/doctor) — separate follow-up slice.",
+    "No changes to the recall_count compounding logic or the §7c ranking formula.",
+    "No breaking changes to the file layout, frontmatter keys, or directory conventions of v0.1.",
+    "No new external services or network dependencies beyond the one-time model download to ~/.cache/fastembed/."
+  ],
+  "hard_constraints": {
+    "rust_edition": "2024",
+    "target_kind": "cli",
+    "deny_unsafe": true,
+    "max_deps": 40,
+    "msrv": "1.85",
+    "additional": {
+      "binary_install_path": "/home/jsy/.local/bin/recall",
+      "model_cache_path": "/home/jsy/.cache/fastembed/",
+      "git_commit_identity": "j0yen <jyen.tech@gmail.com>"
+    }
+  },
+  "five_whys_trace": [
+    {
+      "why": 1,
+      "q": "Why do you want v0.2 of recall now, instead of staying on the working v0.1?",
+      "a": "Two real consumers (SessionStart hook + /self-review Phase 0) are already using --hybrid retrieval, and the compounding-memory loop's quality depends on hybrid working semantically. With HashEmbedder the hybrid leaderboard collapses to pure FTS5 for cross-vocabulary matches, which silently degrades the loop."
+    },
+    {
+      "why": 2,
+      "q": "Why is semantic similarity the load-bearing v0.2 change, given the PRD lists 20+ items?",
+      "a": "The 20-item backlog is mostly CLI sand-the-edges (clap signature changes, JSON serializers, touch/update endpoints) — independent and quick. The embedder swap is the only item that requires real engineering (new dependency, ONNX model lifecycle, lazy fetch, reindex flow) AND directly affects what the consumers retrieve. If the embedder slice doesn't ship, v0.2 is really just v0.1.1."
+    },
+    {
+      "why": 3,
+      "q": "Why in-process via fastembed-rs rather than Ollama or a recall daemon?",
+      "a": "Distribution-as-a-skill is the dominant constraint. A single static ELF plus a lazy ~130MB model download is something the existing wintermute install.sh flow already handles. Ollama forces an out-of-band install + run; a daemon forces systemd-user + socket lifecycle. Neither pays for itself at this scale (≤ a few thousand memories, ≤ a few dozen queries per session). Latency cost — ~500ms-1s first-query cold-cache — is acceptable for the live consumers (single query per SessionStart, single query per Phase 0)."
+    },
+    {
+      "why": 4,
+      "q": "Why slice the embedder swap separately from the CLI gaps in the same v0.2 PRD?",
+      "a": "Autobuilder slices are 1-3 iterations on a falsifiable chunk. The embedder slice alone is plausibly 2-3 iters (deps + plumbing + reindex + tests). Adding 5+ independent clap signature changes blows scope and entangles unrelated test surfaces. Better to ship embedder first, prove the in-process model works in real consumer flows, then layer CLI hygiene on top in a follow-up slice that has nothing to do with embeddings."
+    }
+  ],
+  "ambiguities_resolved": [
+    {
+      "question": "Build target path — PRD says ~/projects/recall/ but the linter slice was there.",
+      "resolution": "Linter moved to ~/projects/recall-memory-linter/ (its actual identity). ~/projects/recall/ is now free and is the canonical autobuilder slice path for this v0.2 work; install target stays ~/.local/bin/recall."
+    },
+    {
+      "question": "Is HashEmbedder removed or retained?",
+      "resolution": "Retained behind --embedder hash. Used for offline contexts, deterministic tests, and the AC5 differential semantic test which needs both embedders co-resident."
+    },
+    {
+      "question": "How is fastembed-rs model handled at install time?",
+      "resolution": "Lazy fetch on first use into ~/.cache/fastembed/. No pre-fetch, no daemon, no Ollama. First query in a fresh process pays the load cost (~500ms-1s warm cache, longer if model not yet downloaded). Documented as accepted latency in the AC8 SHOULD."
+    }
+  ]
+}
