@@ -1,0 +1,21 @@
+{
+  "schema": "autobuilder.amendment_request.v1",
+  "iteration": 0,
+  "kind": "widen_constraint",
+  "current": {
+    "unfakeable_metric.name": "acceptance_tests_passing",
+    "unfakeable_metric.harness_command": "cargo test --manifest-path crates/recall-memory-linter/Cargo.toml --tests -- --format=terse 2>&1 | grep -cE '^test .* \\.\\.\\. ok$'"
+  },
+  "proposed": {
+    "unfakeable_metric.name": "acceptance_tests_passing_count",
+    "unfakeable_metric.harness_command": "bash scripts/run-metrics.sh && jq -r '.scalars.acceptance_tests_passing_count' target/autobuilder/metrics.json"
+  },
+  "rationale": "Retroactive amendment for commit 07a59df (2026-05-22 16:46 PDT, j0yen), which renamed `unfakeable_metric.name` from `acceptance_tests_passing` -> `acceptance_tests_passing_count` directly without filing this amendment, triggering reviewer-agent block rule #7 (file outside src/ modified during Stage 3 without an amendment).\n\nThe rename itself was substantively correct: the harness emits a *count* of passing tests via `grep -cE '^test .* \\.\\.\\. ok$'`, not a boolean. The scaffold-time name `acceptance_tests_passing` suggested boolean semantics and was misaligned with both the harness output schema (metrics.json field `scalars.acceptance_tests_passing_count`) and the metric's `lower_is_better: false` numeric semantics.\n\nThis amendment also fixes a latent bug in `harness_command`: the original command referenced `crates/recall-memory-linter/Cargo.toml`, which does not exist on disk. The actual project has `Cargo.toml` at the project root, and the canonical metric entrypoint is `scripts/run-metrics.sh` (which uses `cd \"$(dirname \"$0\")/..\"` to relocate). The proposed command pipes through `scripts/run-metrics.sh` and reads the count from the normalized metrics.json, matching what the autobuilder binary and gate already consume.\n\nNo MUST-AC is added, weakened, or relaxed. No hard constraint is widened beyond clarifying the contract field that was misnamed at scaffold time.",
+  "evidence_refs": [
+    "target/autobuilder/receipts/reviewer-agent.json",
+    "target/autobuilder/metrics.json",
+    "scripts/run-metrics.sh"
+  ],
+  "filed_by": "claude-opus-4-7 (orchestrator session 2026-05-22)",
+  "filed_at": "2026-05-23T05:10:00Z"
+}
