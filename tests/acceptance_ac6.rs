@@ -13,10 +13,45 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::embeddings::EmbedderKind;
+use recall::index::Index;
+use recall::memory::{Kind, Memory, Subject};
+use recall::paths;
+use recall::store::FileStore;
+
 #[test]
 fn acceptance_ac6() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC6 not yet implemented — see file header");
+    // AC6: reindex regenerates the vector column using whichever embedder
+    // is active. After switching hash → fastembed, the stored embedding
+    // length jumps from 256 to 384.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+
+    let store = FileStore::open(root.clone()).unwrap();
+    let idx = Index::open(&paths::index_db(&root)).unwrap();
+
+    // Seed: one memory written under the hash embedder.
+    let m = Memory::new(Kind::Semantic, Subject::user(), "test memory for reindex");
+    let path = store.write(&m).unwrap();
+    let hash_e = EmbedderKind::Hash.build().unwrap();
+    let v = hash_e.embed(&m.body).unwrap();
+    idx.upsert(&m, &path, Some((hash_e.id(), &v))).unwrap();
+    let stored = idx.get_embedding(&m.front.id).unwrap().expect("hash embedding present");
+    assert_eq!(stored.len(), 256, "hash embedding should be 256-dim");
+
+    // Reindex under fastembed.
+    let fe = EmbedderKind::Fastembed.build().unwrap();
+    let it = store.iter_all().filter_map(Result::ok);
+    let n = idx.rebuild_from(it, Some(fe.as_ref())).unwrap();
+    assert_eq!(n, 1, "should have rebuilt 1 memory");
+
+    let stored2 = idx
+        .get_embedding(&m.front.id)
+        .unwrap()
+        .expect("fastembed embedding present after reindex");
+    assert_eq!(
+        stored2.len(),
+        384,
+        "after reindex with fastembed, stored embedding should be 384-dim (BGE-small)"
+    );
 }

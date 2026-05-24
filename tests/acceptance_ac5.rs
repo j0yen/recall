@@ -13,10 +13,44 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::embeddings::{Embedder, FastembedEmbedder, HashEmbedder, cosine};
+
 #[test]
 fn acceptance_ac5() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC5 not yet implemented — see file header");
+    // AC5: Semantic discrimination. A query for the synonym phrase
+    // "dependency tool" should rank a package-manager memory above an
+    // unrelated memory under FastembedEmbedder, with a meaningful
+    // margin that HashEmbedder cannot achieve.
+    let pkg_mgr = "user prefers pnpm as the package manager for TypeScript projects";
+    let unrelated = "the kettle whistled while the cat slept on the windowsill";
+    let query = "dependency tool";
+
+    let fe = FastembedEmbedder::new().expect("init fastembed");
+    let fe_q = fe.embed(query).unwrap();
+    let fe_pkg = fe.embed(pkg_mgr).unwrap();
+    let fe_un = fe.embed(unrelated).unwrap();
+    let fe_sim_pkg = cosine(&fe_q, &fe_pkg);
+    let fe_sim_un = cosine(&fe_q, &fe_un);
+
+    let he = HashEmbedder::new();
+    let he_q = he.embed(query).unwrap();
+    let he_pkg = he.embed(pkg_mgr).unwrap();
+    let he_un = he.embed(unrelated).unwrap();
+    let he_sim_pkg = cosine(&he_q, &he_pkg);
+    let he_sim_un = cosine(&he_q, &he_un);
+
+    // Fastembed must rank the package-manager memory above the unrelated one.
+    assert!(
+        fe_sim_pkg > fe_sim_un,
+        "fastembed expected pkg>un but pkg={fe_sim_pkg} un={fe_sim_un}"
+    );
+
+    // The gap under fastembed must materially exceed the gap under hash —
+    // this is the falsifiable "synonyms now work" assertion.
+    let fe_gap = fe_sim_pkg - fe_sim_un;
+    let he_gap = he_sim_pkg - he_sim_un;
+    assert!(
+        fe_gap > he_gap + 0.05,
+        "fastembed gap {fe_gap} should beat hash gap {he_gap} by >0.05"
+    );
 }

@@ -15,8 +15,20 @@
 
 #[test]
 fn acceptance_ac1() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC1 not yet implemented — see file header");
+    // AC1: Cargo.toml depends on `fastembed`, pinned with a tilde or
+    // caret range. Just-built crate must compile (we're here, so it does).
+    let toml = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("read Cargo.toml");
+    let dep_line = toml
+        .lines()
+        .find(|l| l.trim_start().starts_with("fastembed"))
+        .expect("Cargo.toml must contain a fastembed dependency line");
+    // Accept caret (default) or tilde version constraints, with or
+    // without a `version =` key.
+    let constraint_ok = dep_line.contains('"')
+        && (dep_line.contains("\"~") || dep_line.contains("\"^") || dep_line.contains("\"4") || dep_line.contains("\"5"));
+    assert!(
+        constraint_ok,
+        "fastembed dep line should pin a 4.x or 5.x version: {dep_line}"
+    );
 }

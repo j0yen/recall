@@ -13,10 +13,26 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::embeddings::{Embedder, FastembedEmbedder, HashEmbedder};
+
 #[test]
 fn acceptance_ac3() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC3 not yet implemented — see file header");
+    // AC3: FastembedEmbedder reports
+    //   embedding_id = "fastembed:bge-small-en-v1.5"
+    //   embedding_dim = 384
+    // HashEmbedder keeps its own id and 256-dim.
+    let fe = FastembedEmbedder::new().expect("init fastembed");
+    assert_eq!(fe.id(), "fastembed:bge-small-en-v1.5");
+    assert_eq!(fe.dim(), 384);
+
+    let he = HashEmbedder::new();
+    assert_eq!(he.dim(), 256);
+    assert!(he.id().starts_with("hash-v1"), "hash id was {}", he.id());
+    assert_ne!(fe.id(), he.id());
+
+    // Embed-output dimensionality matches reported dim.
+    let v = fe.embed("dimensionality check").expect("embed");
+    assert_eq!(v.len(), 384);
+    let hv = he.embed("dimensionality check").expect("embed");
+    assert_eq!(hv.len(), 256);
 }

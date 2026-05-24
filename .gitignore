@@ -2,3 +2,8 @@
 **/*.rs.bk
 Cargo.lock.bk
 .DS_Store
+
+# fastembed-rs default cache dir if cache_dir() falls back; FastembedEmbedder
+# anchors at ~/.cache/fastembed/ but a stray PWD-rooted cache could appear
+# (e.g. when run with HOME unset). Belt-and-suspenders.
+/.fastembed_cache/

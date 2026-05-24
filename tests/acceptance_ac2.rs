@@ -13,10 +13,23 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::embeddings::{Embedder, FastembedEmbedder};
+
 #[test]
 fn acceptance_ac2() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC2 not yet implemented — see file header");
+    // AC2: FastembedEmbedder constructor lazy-fetches BGE-small to
+    // ~/.cache/fastembed/ and subsequent constructions reuse the cache.
+    let e = FastembedEmbedder::new().expect("FastembedEmbedder::new should succeed");
+    let v = e.embed("hello world").expect("embed should succeed");
+    assert!(!v.is_empty(), "embed must return a non-empty vector");
+
+    // A second construction should not blow up. Real cache-reuse can't
+    // be asserted on without poking implementation details, but the
+    // second call completing at all is a meaningful smoke check.
+    let e2 = FastembedEmbedder::new().expect("second construction should succeed");
+    assert_eq!(e.dim(), e2.dim(), "dim should be stable across constructions");
+
+    // Verify the model output is normalized (L2 norm ≈ 1).
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    assert!((norm - 1.0).abs() < 1e-3, "L2 norm should be ~1, was {norm}");
 }

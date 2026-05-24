@@ -13,10 +13,39 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::memory::{Kind, Memory, Subject};
+
 #[test]
 fn acceptance_ac7() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC7 not yet implemented — see file header");
+    // AC7: file layout and YAML frontmatter remain byte-compatible with
+    // v0.1. A v0.1-shaped frontmatter must parse and round-trip through
+    // v0.2 read → write → read with stable frontmatter fields.
+    let v01_text = "---\nid: 01JE5VAB3X6QWZ8VHJP7F0RKM5\nkind: semantic\nsubject: user\nconfidence: 0.8\ncreated_at: 2026-05-22T16:55:30Z\nlast_recalled_at: 2026-05-23T08:12:01Z\nrecall_count: 3\n---\n\nbody text here\n";
+
+    let parsed = Memory::from_markdown(v01_text).expect("parse v0.1 frontmatter");
+    let written = parsed.to_markdown().expect("write v0.2");
+    let reparsed = Memory::from_markdown(&written).expect("reparse v0.2 output");
+
+    assert_eq!(parsed.front.id, reparsed.front.id);
+    assert_eq!(parsed.front.kind, Kind::Semantic);
+    assert_eq!(reparsed.front.kind, Kind::Semantic);
+    assert_eq!(parsed.front.subject.as_str(), "user");
+    assert_eq!(parsed.front.subject.as_str(), reparsed.front.subject.as_str());
+    assert_eq!(parsed.front.confidence, reparsed.front.confidence);
+    assert_eq!(parsed.front.recall_count, reparsed.front.recall_count);
+    assert_eq!(parsed.front.created_at, reparsed.front.created_at);
+    assert_eq!(parsed.front.last_recalled_at, reparsed.front.last_recalled_at);
+    assert_eq!(parsed.body.trim(), "body text here");
+
+    // Confirm the canonical fields are still present in the written form.
+    for needle in ["id:", "kind:", "subject:", "confidence:", "created_at:", "recall_count:"] {
+        assert!(written.contains(needle), "missing {needle} in v0.2 output:\n{written}");
+    }
+
+    // Confirm a programmatically-constructed memory also round-trips.
+    let m = Memory::new(Kind::Reflective, Subject::self_(), "rt body");
+    let s = m.to_markdown().expect("write rt");
+    let m2 = Memory::from_markdown(&s).expect("re-read rt");
+    assert_eq!(m.front.id, m2.front.id);
+    assert_eq!(m.front.subject.as_str(), m2.front.subject.as_str());
 }

@@ -13,10 +13,25 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
 
+use recall::embeddings::EmbedderKind;
+
 #[test]
 fn acceptance_ac4() {
-    // edit-agent: replace this stub with a real assertion. The
-    // panic keeps the test failing until you do, so the loop
-    // sees a real Stage 3 signal.
-    panic!("AC AC4 not yet implemented — see file header");
+    // AC4: CLI accepts `--embedder hash|fastembed`. Default = fastembed.
+
+    // Library-side parser matches the CLI's accepted values.
+    assert_eq!(EmbedderKind::parse("hash").unwrap(), EmbedderKind::Hash);
+    assert_eq!(EmbedderKind::parse("fastembed").unwrap(), EmbedderKind::Fastembed);
+    assert!(EmbedderKind::parse("ollama").is_err(), "invalid value should error");
+
+    // The recall binary's --help text must surface the flag and its default.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_recall"))
+        .arg("--help")
+        .output()
+        .expect("spawn recall --help");
+    assert!(out.status.success(), "recall --help exited non-zero");
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--embedder"), "--embedder flag missing from --help:\n{help}");
+    assert!(help.contains("fastembed"), "fastembed default missing from --help:\n{help}");
+    assert!(help.contains("hash"), "hash option missing from --help:\n{help}");
 }
