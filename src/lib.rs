@@ -11,6 +11,7 @@
 #![allow(missing_docs)]
 
 pub mod config;
+pub mod daemon;
 pub mod embeddings;
 pub mod index;
 pub mod memory;
