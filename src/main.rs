@@ -535,6 +535,116 @@ fn ping_socket_sync(socket: &std::path::Path) -> Result<serde_json::Value> {
     }
 }
 
+/// Blocking helper: send a `query` op over UDS and return the
+/// `ranked_hits` array from the daemon's `{ok: {...}}` body. Returns
+/// `Err` if the socket is dead, the daemon returned an `{error: ...}`
+/// frame, or the response shape is malformed.
+fn query_socket_sync(
+    socket: &std::path::Path,
+    text: &str,
+    limit: usize,
+    hybrid: bool,
+    project_subject: Option<&str>,
+) -> Result<Vec<serde_json::Value>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build current-thread tokio runtime for daemon query")?;
+    let mut args = serde_json::json!({
+        "text": text,
+        "limit": limit,
+        "hybrid": hybrid,
+    });
+    if let Some(p) = project_subject {
+        args["project_subject"] = serde_json::Value::String(p.to_string());
+    }
+    let req = serde_json::json!({ "op": "query", "args": args });
+    let resp = rt.block_on(daemon::client_roundtrip(socket, &req))?;
+    if let Some(ok) = resp.get("ok") {
+        Ok(ok
+            .get("ranked_hits")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default())
+    } else if let Some(err) = resp.get("error") {
+        Err(anyhow!("daemon query returned error: {err}"))
+    } else {
+        Err(anyhow!("daemon query returned malformed response: {resp}"))
+    }
+}
+
+/// Print the daemon's `ranked_hits` payload using the same text/json
+/// shape as the in-process `cmd_query` output. `max_tokens` applies the
+/// same char-budget truncation as the in-process path.
+fn render_daemon_query_hits(
+    hits: &[serde_json::Value],
+    max_tokens: usize,
+    format: &str,
+) -> Result<()> {
+    let mut hits = hits.to_vec();
+    if max_tokens > 0 {
+        let budget_bytes = max_tokens.saturating_mul(4);
+        let mut used = 0_usize;
+        let mut cut_at = hits.len();
+        for (i, h) in hits.iter().enumerate() {
+            let n = h
+                .get("snippet")
+                .and_then(|s| s.as_str())
+                .map_or(0, str::len);
+            if used.saturating_add(n) > budget_bytes && i > 0 {
+                cut_at = i;
+                break;
+            }
+            used = used.saturating_add(n);
+        }
+        hits.truncate(cut_at);
+    }
+    if format == "json" {
+        let arr: Vec<serde_json::Value> = hits
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "id": h.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                    "kind": h.get("kind").cloned().unwrap_or(serde_json::Value::Null),
+                    "subject": h.get("subject").cloned().unwrap_or(serde_json::Value::Null),
+                    "path": h.get("path").cloned().unwrap_or(serde_json::Value::Null),
+                    "snippet": h.get("snippet").cloned().unwrap_or(serde_json::Value::Null),
+                    "score": h.get("score").cloned().unwrap_or(serde_json::Value::Null),
+                    "vector_sim": h.get("vector_sim").cloned().unwrap_or(serde_json::Value::Null),
+                    "confidence": h.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+                    "recall_count": h.get("recall_count").cloned().unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        if hits.is_empty() {
+            println!("(no matches)");
+        }
+        for h in &hits {
+            let id = h.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let kind = h.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let subj = h.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+            let score = h.get("score").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+            let vec_sim = h
+                .get("vector_sim")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let recalls = h
+                .get("recall_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let snippet = h.get("snippet").and_then(|v| v.as_str()).unwrap_or("");
+            println!(
+                "{}  [{}/{}]  score={:.3} vec_sim={:.3} recalls={}",
+                id, kind, subj, score, vec_sim, recalls
+            );
+            println!("  {snippet}");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_daemon(op: DaemonOp) -> Result<()> {
     match op {
         DaemonOp::Status { socket, format } => {
@@ -726,6 +836,30 @@ fn cmd_query(
     project_subject: Option<&str>,
     embedder_kind: EmbedderKind,
 ) -> Result<()> {
+    // Auto-forward to the daemon when the call is filter-free: the v0.5.0
+    // `query` op has no filter surface yet, so any subject/kind/since/
+    // min_confidence selector or `--touch` flag stays on the in-process
+    // path. `include_superseded`/`include_decayed` are *true*-means-"no
+    // filter"; default is false → in-process. Any forward failure (dead
+    // socket, malformed response) silently falls back — PRD AC3.
+    let can_forward = subject.is_none()
+        && kind.is_none()
+        && since.is_none()
+        && min_confidence.is_none()
+        && include_superseded
+        && include_decayed
+        && !touch;
+    if can_forward {
+        if let Ok(sock) = daemon::default_socket_path() {
+            if sock.exists() {
+                if let Ok(hits) =
+                    query_socket_sync(&sock, query, limit, hybrid, project_subject)
+                {
+                    return render_daemon_query_hits(&hits, max_tokens, format);
+                }
+            }
+        }
+    }
     let idx = Index::open(&paths::index_db(root))?;
     let weights: Weights = config.into();
     let need_overfetch = subject.is_some()
