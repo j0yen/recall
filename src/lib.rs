@@ -10,9 +10,12 @@
 #![cfg_attr(not(test), forbid(unsafe_code))]
 #![allow(missing_docs)]
 
+pub mod config;
 pub mod embeddings;
 pub mod index;
 pub mod memory;
+pub mod observer;
 pub mod paths;
 pub mod retrieval;
+pub mod scratch;
 pub mod store;

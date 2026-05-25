@@ -5,11 +5,14 @@
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
+use recall::config::Config;
 use recall::embeddings::EmbedderKind;
 use recall::index::{Index, MetaRow};
 use recall::memory::{Evidence, Kind, Memory, Subject};
+use recall::observer;
 use recall::paths;
-use recall::retrieval;
+use recall::retrieval::{self, Weights};
+use recall::scratch;
 use recall::store::FileStore;
 use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
@@ -32,6 +35,11 @@ struct Cli {
     /// embedder — deterministic, dependency-free, non-semantic.
     #[arg(long, global = true, default_value = "fastembed", value_parser = ["hash", "fastembed"])]
     embedder: String,
+
+    /// Active project directory for project-boosted ranking. Defaults to
+    /// `$CLAUDE_PROJECT_DIR` or `$PWD`. Pass `--project-dir=""` to disable.
+    #[arg(long, global = true)]
+    project_dir: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -88,6 +96,9 @@ enum Command {
         include_superseded: bool,
         #[arg(long, default_value_t = false)]
         include_decayed: bool,
+        /// Caller-side token budget on returned bodies (0 = unlimited).
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
 
     /// List memories (newest first). Optionally filter by subject prefix.
@@ -106,6 +117,8 @@ enum Command {
         include_superseded: bool,
         #[arg(long, default_value_t = false)]
         include_decayed: bool,
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
 
     /// Show a single memory's Markdown content by id.
@@ -213,6 +226,99 @@ enum Command {
         #[arg(long, default_value_t = false)]
         overwrite: bool,
     },
+
+    /// Phase 3 within-session scratch storage. Scratch entries are excluded
+    /// from default `query` / `list` and are promoted to long-term memory
+    /// via `recall promote`.
+    Scratch {
+        #[command(subcommand)]
+        op: ScratchOp,
+    },
+
+    /// Promote scratch entries from `session/<sid>/` to long-term memory.
+    /// Equivalent to: read each scratch file, write it via `store.write`,
+    /// index it, then delete the scratch file. Stop-hook wires this.
+    Promote {
+        #[arg(long)]
+        session: Option<String>,
+        /// Promote only this id (omit to promote every entry in the session).
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Phase 4 PostToolUse observer. Reads one JSON event per line on stdin
+    /// and parks proposals under `proposals/` for the user to review.
+    Observe {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// List proposed memories awaiting promote/discard.
+    Proposals {
+        /// Promote this proposal id to long-term memory; deletes the proposal file.
+        #[arg(long)]
+        apply: Option<String>,
+        /// Delete this proposal id without promoting.
+        #[arg(long)]
+        discard: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
+    /// Render what changed in the recall store during a session (writes,
+    /// updates, touches, promotions). Best-effort: relies on `created_at`
+    /// and `updated_at` falling within `--since`.
+    SessionDiff {
+        #[arg(long)]
+        session: Option<String>,
+        /// Only include entries created/updated since this duration ago
+        /// (e.g. `2h`, `1d`). Defaults to `8h`.
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ScratchOp {
+    /// Write a scratch memory under `session/<sid>/<id>.md`.
+    Write {
+        #[arg(long, default_value = "episodic")]
+        kind: String,
+        #[arg(long, default_value = "self")]
+        subject: String,
+        #[arg(long)]
+        body: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// List scratch entries. Without --session, walks every session dir.
+    List {
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Show one scratch memory.
+    Show {
+        id: String,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+    /// Wipe a session's scratch dir.
+    Clear {
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -221,7 +327,9 @@ fn main() -> Result<()> {
         Some(r) => r,
         None => paths::root()?,
     };
+    let config = Config::load(&root)?;
     let embedder_kind = EmbedderKind::parse(&cli.embedder)?;
+    let project_subject = resolve_project_subject(cli.project_dir.as_deref());
 
     match cli.command {
         Command::Init => cmd_init(&root),
@@ -258,8 +366,10 @@ fn main() -> Result<()> {
             min_confidence,
             include_superseded,
             include_decayed,
+            max_tokens,
         } => cmd_query(
             &root,
+            &config,
             &query,
             limit,
             &format,
@@ -271,6 +381,8 @@ fn main() -> Result<()> {
             min_confidence,
             include_superseded,
             include_decayed,
+            max_tokens.unwrap_or(config.retrieval.max_tokens),
+            project_subject.as_deref(),
             embedder_kind,
         ),
         Command::List {
@@ -281,6 +393,7 @@ fn main() -> Result<()> {
             limit,
             include_superseded,
             include_decayed,
+            max_tokens,
         } => cmd_list(
             &root,
             subject.as_deref(),
@@ -290,6 +403,7 @@ fn main() -> Result<()> {
             limit,
             include_superseded,
             include_decayed,
+            max_tokens.unwrap_or(config.retrieval.max_tokens),
         ),
         Command::Show { id, format } => cmd_show(&root, &id, &format),
         Command::Delete { id } => cmd_delete(&root, &id),
@@ -334,11 +448,60 @@ fn main() -> Result<()> {
         Command::Stats { format } => cmd_stats(&root, &format),
         Command::Export { format } => cmd_export(&root, &format),
         Command::Import { file, overwrite } => cmd_import(&root, file, overwrite, embedder_kind),
+        Command::Scratch { op } => cmd_scratch(&root, op),
+        Command::Promote {
+            session,
+            id,
+            format,
+        } => cmd_promote(&root, session.as_deref(), id.as_deref(), &format, embedder_kind),
+        Command::Observe { file, format } => cmd_observe(&root, file, &format),
+        Command::Proposals {
+            apply,
+            discard,
+            format,
+        } => cmd_proposals(
+            &root,
+            apply.as_deref(),
+            discard.as_deref(),
+            &format,
+            embedder_kind,
+        ),
+        Command::SessionDiff {
+            session,
+            since,
+            format,
+        } => cmd_session_diff(&root, session.as_deref(), since.as_deref(), &format),
         Command::Where => {
             println!("{}", root.display());
             println!("embedder: {}", cli.embedder);
+            if let Some(p) = &project_subject {
+                println!("project_subject: {p}");
+            }
             Ok(())
         }
+    }
+}
+
+fn resolve_project_subject(explicit: Option<&str>) -> Option<String> {
+    let raw = match explicit {
+        Some(s) if s.is_empty() => return None,
+        Some(s) => s.to_string(),
+        None => match std::env::var("CLAUDE_PROJECT_DIR") {
+            Ok(v) if !v.is_empty() => v,
+            _ => std::env::var("PWD").unwrap_or_default(),
+        },
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    let base = std::path::Path::new(&raw)
+        .file_name()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    if base.is_empty() {
+        None
+    } else {
+        Some(format!("project:{base}"))
     }
 }
 
@@ -434,6 +597,7 @@ fn read_body(body: Option<String>, file: Option<PathBuf>) -> Result<String> {
 
 fn cmd_query(
     root: &std::path::Path,
+    config: &Config,
     query: &str,
     limit: usize,
     format: &str,
@@ -445,9 +609,12 @@ fn cmd_query(
     min_confidence: Option<f64>,
     include_superseded: bool,
     include_decayed: bool,
+    max_tokens: usize,
+    project_subject: Option<&str>,
     embedder_kind: EmbedderKind,
 ) -> Result<()> {
     let idx = Index::open(&paths::index_db(root))?;
+    let weights: Weights = config.into();
     let need_overfetch = subject.is_some()
         || kind.is_some()
         || since.is_some()
@@ -461,9 +628,9 @@ fn cmd_query(
     };
     let mut hits = if hybrid {
         let embedder = embedder_kind.build()?;
-        retrieval::hybrid_search(&idx, embedder.as_ref(), query, inner_limit)?
+        retrieval::hybrid_with(&idx, embedder.as_ref(), query, inner_limit, weights, project_subject)?
     } else {
-        retrieval::search(&idx, query, inner_limit)?
+        retrieval::search_with(&idx, query, inner_limit, weights, project_subject)?
     };
     let store = if since.is_some() {
         Some(FileStore::open(root.to_path_buf())?)
@@ -516,6 +683,9 @@ fn cmd_query(
         true
     });
     hits.truncate(limit);
+    if max_tokens > 0 {
+        truncate_to_token_budget(&mut hits, max_tokens, |r| r.hit.snippet.len());
+    }
     if touch {
         for r in &hits {
             let _ = idx.touch_recall(&r.hit.id);
@@ -554,6 +724,27 @@ fn cmd_query(
     Ok(())
 }
 
+/// Truncate a result list so the cumulative body bytes stay below
+/// `max_tokens * 4` (rough char→token approximation). Items are kept in
+/// rank order; the first item that overflows the budget stops the include.
+fn truncate_to_token_budget<T, F: Fn(&T) -> usize>(items: &mut Vec<T>, max_tokens: usize, body_size: F) {
+    let budget_bytes = max_tokens.saturating_mul(4);
+    if budget_bytes == 0 {
+        return;
+    }
+    let mut used = 0_usize;
+    let mut cut_at = items.len();
+    for (i, item) in items.iter().enumerate() {
+        let n = body_size(item);
+        if used.saturating_add(n) > budget_bytes && i > 0 {
+            cut_at = i;
+            break;
+        }
+        used = used.saturating_add(n);
+    }
+    items.truncate(cut_at);
+}
+
 fn cmd_list(
     root: &std::path::Path,
     subject: Option<&str>,
@@ -563,6 +754,7 @@ fn cmd_list(
     limit: usize,
     include_superseded: bool,
     include_decayed: bool,
+    max_tokens: usize,
 ) -> Result<()> {
     let idx = Index::open(&paths::index_db(root))?;
     let need_overfetch = kind.is_some()
@@ -616,6 +808,12 @@ fn cmd_list(
         true
     });
     hits.truncate(limit);
+    if max_tokens > 0 {
+        // For list, body sizes aren't loaded into Hit; approximate per-entry
+        // as the id+kind+subject overhead (~64 bytes) so the cap is at least
+        // monotone in `limit`. Better fidelity than ignoring max_tokens.
+        truncate_to_token_budget(&mut hits, max_tokens, |_| 64);
+    }
     if format == "json" {
         let arr: Vec<serde_json::Value> = hits
             .iter()
@@ -920,6 +1118,18 @@ fn cmd_doctor(
     let newest = all_meta.iter().map(|m| m.created_at).max();
     let total_recall: u64 = all_meta.iter().map(|m| u64::from(m.recall_count)).sum();
     let decayed = idx.decayed_ids()?;
+    let schema_version = recall::index::read_schema_version(&paths::index_db(root))?;
+    let fs_warning = wal_fs_warning(&paths::index_db(root));
+    let active_embedder_id = match embedder_kind {
+        EmbedderKind::Hash => "hash-v1-d256".to_string(),
+        EmbedderKind::Fastembed => "fastembed:bge-small-en-v1.5".to_string(),
+    };
+    let embedder_mismatch: Vec<String> = embedder_counts
+        .keys()
+        .filter(|k| *k != &active_embedder_id && *k != "(none)")
+        .cloned()
+        .collect();
+    let model_path = fastembed_model_dir();
 
     if format == "json" {
         let obj = serde_json::json!({
@@ -930,6 +1140,12 @@ fn cmd_doctor(
             "supersedes_dangling": dangling,
             "decayed_count": decayed.len(),
             "embedder_histogram": embedder_counts,
+            "active_embedder_id": active_embedder_id,
+            "embedder_id_mismatches": embedder_mismatch,
+            "fastembed_cache_path": model_path,
+            "schema_version": schema_version,
+            "schema_version_expected": recall::index::SCHEMA_VERSION,
+            "filesystem_warning": fs_warning,
             "oldest_created_at": oldest.map(|t| t.to_rfc3339()),
             "newest_created_at": newest.map(|t| t.to_rfc3339()),
             "total_recall_count": total_recall,
@@ -942,20 +1158,85 @@ fn cmd_doctor(
         println!("missing       : {}  (in index, no md on disk)", missing.len());
         println!("dangling sup. : {}  (supersedes a vanished id)", dangling.len());
         println!("decayed       : {}", decayed.len());
+        println!(
+            "schema_version: {}  (expected {})",
+            schema_version.map_or("(missing)".into(), |v| v.to_string()),
+            recall::index::SCHEMA_VERSION
+        );
+        println!("active embedd : {active_embedder_id}");
+        if let Some(p) = &model_path {
+            println!("fastembed dir : {p}");
+        }
         println!("embedders     :");
         for (k, v) in &embedder_counts {
-            println!("  {k}: {v}");
+            let flag = if k == &active_embedder_id || k == "(none)" {
+                ""
+            } else {
+                "  (mismatch — reindex)"
+            };
+            println!("  {k}: {v}{flag}");
         }
         if let (Some(o), Some(n)) = (oldest, newest) {
             println!("oldest        : {o}");
             println!("newest        : {n}");
         }
         println!("total recalls : {total_recall}");
+        if let Some(w) = &fs_warning {
+            println!("fs warning    : {w}");
+        }
         if !orphans.is_empty() && !fix {
             println!("hint: run `recall doctor --fix` to reindex.");
         }
+        if !embedder_mismatch.is_empty() {
+            println!(
+                "hint: {} memories have a different embedder id; run `recall reindex` to rebuild.",
+                embedder_mismatch.iter().map(|_| ()).count()
+            );
+        }
     }
     Ok(())
+}
+
+/// `~/.cache/fastembed` (or `$XDG_CACHE_HOME/fastembed`), if it exists.
+fn fastembed_model_dir() -> Option<String> {
+    let base = if let Ok(xdg) = std::env::var("XDG_CACHE_HOME") {
+        if xdg.is_empty() { None } else { Some(xdg) }
+    } else {
+        std::env::var("HOME").ok().map(|h| format!("{h}/.cache"))
+    }?;
+    let p = std::path::Path::new(&base).join("fastembed");
+    if p.exists() {
+        Some(p.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
+/// Warn if the SQLite file lives on a filesystem where WAL is known to be
+/// unsafe (NFS, SMB/CIFS, fuse-overlay). Best-effort: returns None if we
+/// can't classify the filesystem.
+fn wal_fs_warning(db_path: &std::path::Path) -> Option<String> {
+    let canon = std::fs::canonicalize(db_path).ok()?;
+    let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+    let mut best: Option<(usize, String, String)> = None;
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let _dev = parts.next()?;
+        let mount_point = parts.next()?;
+        let fs_type = parts.next()?;
+        if canon.starts_with(mount_point) && mount_point.len() > best.as_ref().map_or(0, |t| t.0) {
+            best = Some((mount_point.len(), mount_point.into(), fs_type.into()));
+        }
+    }
+    let (_, mount, fs_type) = best?;
+    const UNSAFE_FS: &[&str] = &["nfs", "nfs4", "cifs", "smbfs", "fuse.sshfs"];
+    if UNSAFE_FS.iter().any(|u| fs_type.starts_with(u)) {
+        return Some(format!(
+            "{} is on {fs_type} at {mount} — WAL is unsafe here. Consider PRAGMA journal_mode=DELETE.",
+            db_path.display(),
+        ));
+    }
+    None
 }
 
 fn cmd_gc(
@@ -1183,6 +1464,308 @@ fn meta_to_json(m: &MetaRow) -> serde_json::Value {
         "supersedes": m.supersedes,
         "embedding_id": m.embedding_id,
     })
+}
+
+fn cmd_scratch(root: &std::path::Path, op: ScratchOp) -> Result<()> {
+    match op {
+        ScratchOp::Write {
+            kind,
+            subject,
+            body,
+            file,
+            session,
+        } => {
+            let sid = scratch::resolve_session_id(session.as_deref())?;
+            let body_text = read_body(body, file)?;
+            if body_text.trim().is_empty() {
+                return Err(anyhow!("body is empty"));
+            }
+            let kind: Kind = kind.parse()?;
+            let mem = Memory::new(kind, Subject(subject), body_text);
+            scratch::write(root, &sid, &mem)?;
+            println!("{}", mem.front.id);
+            Ok(())
+        }
+        ScratchOp::List { session, format } => {
+            let entries = scratch::list(root, session.as_deref())?;
+            if format == "json" {
+                let arr: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|(m, p)| {
+                        serde_json::json!({
+                            "id": m.front.id,
+                            "kind": m.front.kind.as_str(),
+                            "subject": m.front.subject.as_str(),
+                            "path": p.to_string_lossy(),
+                            "created_at": m.front.created_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&arr)?);
+            } else {
+                if entries.is_empty() {
+                    println!("(no scratch)");
+                }
+                for (m, p) in entries {
+                    println!(
+                        "{}  [{}/{}]  {}",
+                        m.front.id,
+                        m.front.kind.as_str(),
+                        m.front.subject.as_str(),
+                        p.display()
+                    );
+                }
+            }
+            Ok(())
+        }
+        ScratchOp::Show {
+            id,
+            session,
+            format,
+        } => {
+            let sid = scratch::resolve_session_id(session.as_deref())?;
+            let (mem, path) = scratch::show(root, &sid, &id)?;
+            if format == "json" {
+                let fm_yaml = serde_yaml::to_string(&mem.front)?;
+                let fm_value: serde_yaml::Value = serde_yaml::from_str(&fm_yaml)?;
+                let obj = serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "frontmatter": serde_json::to_value(&fm_value)?,
+                    "body": mem.body,
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            } else {
+                println!("# {}", path.display());
+                println!("{}", mem.to_markdown()?);
+            }
+            Ok(())
+        }
+        ScratchOp::Clear { session } => {
+            let sid = scratch::resolve_session_id(session.as_deref())?;
+            let n = scratch::clear(root, &sid)?;
+            println!("cleared {n} scratch from session {sid}");
+            Ok(())
+        }
+    }
+}
+
+fn cmd_promote(
+    root: &std::path::Path,
+    session: Option<&str>,
+    only_id: Option<&str>,
+    format: &str,
+    embedder_kind: EmbedderKind,
+) -> Result<()> {
+    let sid = scratch::resolve_session_id(session)?;
+    let entries = scratch::list(root, Some(&sid))?;
+    let filtered: Vec<_> = entries
+        .into_iter()
+        .filter(|(m, _)| only_id.map_or(true, |x| m.front.id == x))
+        .collect();
+    if filtered.is_empty() {
+        if format == "json" {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({"promoted": []}))?);
+        } else {
+            println!("(nothing to promote in session {sid})");
+        }
+        return Ok(());
+    }
+    let store = FileStore::open(root.to_path_buf())?;
+    let idx = Index::open(&paths::index_db(root))?;
+    let embedder = embedder_kind.build()?;
+    let mut promoted: Vec<String> = Vec::new();
+    for (mem, path) in filtered {
+        let new_path = store.write(&mem)?;
+        let vec = embedder.embed(&mem.body)?;
+        idx.upsert(&mem, &new_path, Some((embedder.id(), &vec)))?;
+        scratch::remove(&path)?;
+        promoted.push(mem.front.id);
+    }
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session": sid,
+                "promoted": promoted,
+            }))?
+        );
+    } else {
+        for id in &promoted {
+            println!("promoted {id}");
+        }
+        println!("({} promoted from session {sid})", promoted.len());
+    }
+    Ok(())
+}
+
+fn cmd_observe(root: &std::path::Path, file: Option<PathBuf>, format: &str) -> Result<()> {
+    let reader: Box<dyn BufRead> = match file {
+        Some(p) => Box::new(io::BufReader::new(
+            std::fs::File::open(&p).with_context(|| format!("open {}", p.display()))?,
+        )),
+        None => Box::new(io::stdin().lock()),
+    };
+    let written = observer::run(root, reader)?;
+    if format == "json" {
+        let arr: Vec<String> = written
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"proposed": arr}))?
+        );
+    } else if written.is_empty() {
+        println!("(no proposals)");
+    } else {
+        for p in written {
+            println!("proposed {}", p.display());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_proposals(
+    root: &std::path::Path,
+    apply: Option<&str>,
+    discard: Option<&str>,
+    format: &str,
+    embedder_kind: EmbedderKind,
+) -> Result<()> {
+    if apply.is_some() && discard.is_some() {
+        return Err(anyhow!("--apply and --discard are mutually exclusive"));
+    }
+    if let Some(id) = apply {
+        let entries = observer::list_proposals(root)?;
+        let (mem, path) = entries
+            .into_iter()
+            .find(|(m, _)| m.front.id == id)
+            .ok_or_else(|| anyhow!("proposal {id} not found"))?;
+        let store = FileStore::open(root.to_path_buf())?;
+        let idx = Index::open(&paths::index_db(root))?;
+        let new_path = store.write(&mem)?;
+        let embedder = embedder_kind.build()?;
+        let vec = embedder.embed(&mem.body)?;
+        idx.upsert(&mem, &new_path, Some((embedder.id(), &vec)))?;
+        std::fs::remove_file(&path)?;
+        println!("applied {id}");
+        return Ok(());
+    }
+    if let Some(id) = discard {
+        let entries = observer::list_proposals(root)?;
+        let (_, path) = entries
+            .into_iter()
+            .find(|(m, _)| m.front.id == id)
+            .ok_or_else(|| anyhow!("proposal {id} not found"))?;
+        std::fs::remove_file(&path)?;
+        println!("discarded {id}");
+        return Ok(());
+    }
+    let entries = observer::list_proposals(root)?;
+    if format == "json" {
+        let arr: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|(m, p)| {
+                serde_json::json!({
+                    "id": m.front.id,
+                    "kind": m.front.kind.as_str(),
+                    "subject": m.front.subject.as_str(),
+                    "path": p.to_string_lossy(),
+                    "created_at": m.front.created_at.to_rfc3339(),
+                    "body_preview": m.body.chars().take(160).collect::<String>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        if entries.is_empty() {
+            println!("(no proposals)");
+        }
+        for (m, p) in entries {
+            println!("{}  [{}/{}]  {}", m.front.id, m.front.kind.as_str(), m.front.subject.as_str(), p.display());
+            let preview: String = m.body.chars().take(120).collect();
+            println!("  {preview}");
+        }
+        if entries_present(root) {
+            println!("(apply with `recall proposals --apply <id>`; discard with `--discard <id>`)");
+        }
+    }
+    Ok(())
+}
+
+fn entries_present(root: &std::path::Path) -> bool {
+    observer::list_proposals(root).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+fn cmd_session_diff(
+    root: &std::path::Path,
+    session: Option<&str>,
+    since: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let cutoff = Utc::now() - parse_since(since.unwrap_or("8h"))?;
+    let idx = Index::open(&paths::index_db(root))?;
+    let all = idx.all_meta()?;
+
+    let mut new_memories: Vec<&MetaRow> = Vec::new();
+    let mut updated: Vec<&MetaRow> = Vec::new();
+    let mut touched: Vec<&MetaRow> = Vec::new();
+    for m in &all {
+        if m.created_at >= cutoff {
+            new_memories.push(m);
+        } else if let Some(u) = m.updated_at {
+            if u >= cutoff {
+                updated.push(m);
+            }
+        }
+        if let Some(t) = m.last_recalled_at {
+            if t >= cutoff && m.created_at < cutoff {
+                touched.push(m);
+            }
+        }
+    }
+
+    let scratch_entries = match session {
+        Some(s) => scratch::list(root, Some(s))?,
+        None => Vec::new(),
+    };
+
+    if format == "json" {
+        let obj = serde_json::json!({
+            "session": session,
+            "since": since.unwrap_or("8h"),
+            "new":     new_memories.iter().map(|m| meta_to_json(m)).collect::<Vec<_>>(),
+            "updated": updated.iter().map(|m| meta_to_json(m)).collect::<Vec<_>>(),
+            "touched": touched.iter().map(|m| meta_to_json(m)).collect::<Vec<_>>(),
+            "scratch_pending": scratch_entries.iter().map(|(m, p)| serde_json::json!({
+                "id": m.front.id,
+                "subject": m.front.subject.as_str(),
+                "path": p.to_string_lossy(),
+            })).collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        println!("# session diff — since {}", since.unwrap_or("8h"));
+        println!("new     ({}):", new_memories.len());
+        for m in &new_memories {
+            println!("  + {}  [{}/{}]", m.id, m.kind, m.subject);
+        }
+        println!("updated ({}):", updated.len());
+        for m in &updated {
+            println!("  ~ {}  [{}/{}]", m.id, m.kind, m.subject);
+        }
+        println!("touched ({}):", touched.len());
+        for m in &touched {
+            println!("  · {}  recalls={}", m.id, m.recall_count);
+        }
+        if !scratch_entries.is_empty() {
+            println!("scratch pending ({}):", scratch_entries.len());
+            for (m, _) in &scratch_entries {
+                println!("  ? {}  [{}/{}]", m.front.id, m.front.kind.as_str(), m.front.subject.as_str());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Extended duration parser used by `gc --older-than`: accepts the `m/h/d`

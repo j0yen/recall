@@ -13,6 +13,23 @@ use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
+/// Read the persisted schema_version row. Returns None if the row is missing
+/// (which means the store predates `schema_meta`).
+pub fn read_schema_version(db_path: &Path) -> Result<Option<u32>> {
+    if !db_path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open(db_path)?;
+    let v: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(v.and_then(|s| s.parse().ok()))
+}
+
 pub struct Index {
     conn: Connection,
 }

@@ -29,6 +29,17 @@ pub fn session_dir(root: &Path) -> PathBuf {
     root.join("session")
 }
 
+/// Scratch dir for a single session — `session/<sid>/`. Phase 3.
+pub fn scratch_session_dir(root: &Path, session_id: &str) -> PathBuf {
+    session_dir(root).join(session_id)
+}
+
+/// Where Phase 4 `recall propose` parks draft memories before the user
+/// promotes or discards them. `proposals/<id>.md`.
+pub fn proposals_dir(root: &Path) -> PathBuf {
+    root.join("proposals")
+}
+
 /// Where on disk a memory's Markdown file lives, given its subject and id.
 /// Layout: `memories/<namespace>/[<slug>/]<id>.md`.
 pub fn memory_path(root: &Path, subject: &crate::memory::Subject, id: &str) -> PathBuf {

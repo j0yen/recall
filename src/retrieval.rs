@@ -29,6 +29,8 @@ pub struct Weights {
     pub recall_count: f64,
     /// Confidence in [0,1].
     pub confidence: f64,
+    /// Extra weight added when the hit's subject equals the active project.
+    pub project_boost: f64,
 }
 
 impl Default for Weights {
@@ -39,12 +41,26 @@ impl Default for Weights {
             recency: 0.3,
             recall_count: 0.2,
             confidence: 0.5,
+            project_boost: 0.5,
+        }
+    }
+}
+
+impl From<&crate::config::Config> for Weights {
+    fn from(c: &crate::config::Config) -> Self {
+        Self {
+            bm25: c.weights.bm25,
+            vector: c.weights.vector,
+            recency: c.weights.recency,
+            recall_count: c.weights.recall_count,
+            confidence: c.weights.confidence,
+            project_boost: c.retrieval.project_boost,
         }
     }
 }
 
 pub fn search(idx: &Index, query: &str, limit: usize) -> Result<Vec<RankedHit>> {
-    search_with(idx, query, limit, Weights::default())
+    search_with(idx, query, limit, Weights::default(), None)
 }
 
 pub fn search_with(
@@ -52,11 +68,12 @@ pub fn search_with(
     query: &str,
     limit: usize,
     weights: Weights,
+    project_subject: Option<&str>,
 ) -> Result<Vec<RankedHit>> {
     let raw = idx.search(query, limit * 4)?;
     let mut ranked: Vec<RankedHit> = raw
         .into_iter()
-        .map(|h| score(h, 0.0, weights))
+        .map(|h| score(h, 0.0, weights, project_subject))
         .collect();
     ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(limit);
@@ -70,7 +87,7 @@ pub fn hybrid_search(
     query: &str,
     limit: usize,
 ) -> Result<Vec<RankedHit>> {
-    hybrid_with(idx, embedder, query, limit, Weights::default())
+    hybrid_with(idx, embedder, query, limit, Weights::default(), None)
 }
 
 pub fn hybrid_with(
@@ -79,6 +96,7 @@ pub fn hybrid_with(
     query: &str,
     limit: usize,
     weights: Weights,
+    project_subject: Option<&str>,
 ) -> Result<Vec<RankedHit>> {
     let overfetch = limit * 4;
     let fts = idx.search(query, overfetch)?;
@@ -104,7 +122,7 @@ pub fn hybrid_with(
         .into_values()
         .map(|(mut h, bm25, sim, has_bm25)| {
             h.bm25 = if has_bm25 { bm25 } else { 0.0 };
-            score(h, f64::from(sim), weights)
+            score(h, f64::from(sim), weights, project_subject)
         })
         .collect();
     ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -112,7 +130,7 @@ pub fn hybrid_with(
     Ok(ranked)
 }
 
-fn score(hit: Hit, vector_sim: f64, w: Weights) -> RankedHit {
+fn score(hit: Hit, vector_sim: f64, w: Weights, project_subject: Option<&str>) -> RankedHit {
     let bm25_score = if hit.bm25 == 0.0 { 0.0 } else { -hit.bm25 };
     let recency_score = match hit.last_recalled_at {
         Some(t) => {
@@ -122,11 +140,16 @@ fn score(hit: Hit, vector_sim: f64, w: Weights) -> RankedHit {
         None => 0.0,
     };
     let recall_score = (f64::from(hit.recall_count) / 5.0).tanh();
+    let project_bonus = match project_subject {
+        Some(p) if hit.subject == p => w.project_boost,
+        _ => 0.0,
+    };
     let total = w.bm25 * bm25_score
         + w.vector * vector_sim
         + w.recency * recency_score
         + w.recall_count * recall_score
-        + w.confidence * hit.confidence;
+        + w.confidence * hit.confidence
+        + project_bonus;
     RankedHit {
         hit,
         score: total,
