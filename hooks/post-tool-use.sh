@@ -1,36 +1,48 @@
 #!/usr/bin/env bash
-# recall PostToolUseFailure hook — feed tool errors to `recall observe`.
+# recall PostToolUseFailure hook (v0.4.1, *braid* correlator) — write the
+# error to a per-session state file so the next UserPromptSubmit can pair
+# it with the user's prompt. This hook does NOT call `recall observe`
+# anymore — the observe call moves to recall-user-prompt.sh, where the
+# joined event has a non-empty `user_prompt_after` and the heuristic
+# catalog can actually fire.
 #
-# Claude Code delivers the hook payload as one JSON object on stdin. The
-# observer expects `{tool_name, tool_input, tool_response, status,
-# user_prompt_after}`. We translate from the harness's wire format, mark
-# `status: error` (this hook only fires on failure), and leave
-# `user_prompt_after` empty.
+# State layout:
+#   ~/.cache/recall-braid/<session-id>/last-error.json
+#     { ts_unix, ts_mono, tool_name, tool_input, tool_response }
 #
-# CAVEAT: with `user_prompt_after` empty the v0.4 heuristic catalog will
-# never propose. Wiring this in is the structural half; the functional
-# half is a UserPromptSubmit correlator that pairs the most recent error
-# with the next user prompt. Tracked as v0.4.1.
+# Atomic write via tempfile + rename. Per-session subdir keeps concurrent
+# Claude sessions from cross-pollinating. If $CLAUDE_SESSION_ID is unset,
+# no-op (better to drop the event than to merge it with another session).
 #
 # Silent on any failure — never block a Claude turn on telemetry.
 
 set -uo pipefail
 exec 2>/dev/null
 
-RECALL_BIN="${RECALL_BIN:-$HOME/.local/bin/recall}"
 JQ="${JQ:-/usr/sbin/jq}"
-[ -x "$RECALL_BIN" ] || exit 0
+SESSION_ID="${CLAUDE_SESSION_ID:-}"
 [ -x "$JQ" ] || exit 0
+[ -n "$SESSION_ID" ] || exit 0
 
 raw="$(cat -)"
 [ -z "$raw" ] && exit 0
 
+ts_unix="$(date +%s)"
+ts_mono="$(awk '{print $1}' /proc/uptime 2>/dev/null || echo 0)"
+
 event="$("$JQ" -cn \
+  --argjson ts_unix "$ts_unix" \
+  --arg ts_mono "$ts_mono" \
   --arg name "$("$JQ" -r '.tool_name // empty' <<<"$raw")" \
   --argjson input "$("$JQ" '.tool_input // {}' <<<"$raw")" \
   --argjson resp  "$("$JQ" '.tool_response // {}' <<<"$raw")" \
-  '{tool_name:$name, tool_input:$input, tool_response:$resp, status:"error"}')"
+  '{ts_unix:$ts_unix, ts_mono:($ts_mono|tonumber), tool_name:$name, tool_input:$input, tool_response:$resp}')"
 [ -z "$event" ] && exit 0
 
-printf '%s\n' "$event" | "$RECALL_BIN" observe --format text >/dev/null || true
+dir="$HOME/.cache/recall-braid/$SESSION_ID"
+mkdir -p "$dir" 2>/dev/null || exit 0
+
+tmp="$(mktemp "$dir/.last-error.XXXXXX.json" 2>/dev/null)" || exit 0
+printf '%s\n' "$event" > "$tmp" || { rm -f "$tmp"; exit 0; }
+mv -f "$tmp" "$dir/last-error.json" 2>/dev/null || rm -f "$tmp"
 exit 0
