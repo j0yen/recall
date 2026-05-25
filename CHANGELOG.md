@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.3 — 2026-05-25
+
+Raise the braid freshness gate default from 60s to 300s so human-paced
+turns (read assistant message + type corrective reply) don't silently
+drop. `$RECALL_BRAID_MAX_AGE` env override is preserved and now
+documented in `README.md` under Configuration. No Rust code change —
+literal-value bump in `hooks/user-prompt-submit.sh` plus docs.
+
+Motivated by live verification 2026-05-25: a ~120s human read+type gap
+tripped the 60s gate and dropped a real correction event. 300s comfortably
+covers human-paced cycles while still well short of session drift
+(coincides with Anthropic prompt-cache TTL).
+
 ## v0.4.2 — 2026-05-25
 
 Fix the braid correlator hooks: v0.4.1 read `$CLAUDE_SESSION_ID` from
