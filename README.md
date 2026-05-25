@@ -111,6 +111,16 @@ with corrective user prompts get parked as `reflective` draft
 memories under `~/.claude/recall/proposals/`. Review with
 `recall proposals` and promote with `recall promote <id>`.
 
+## Configuration
+
+Environment variables read by the hooks:
+
+| Var | Default | Effect |
+|---|---|---|
+| `RECALL_BIN` | `~/.local/bin/recall` | Path to the recall binary |
+| `JQ` | `/usr/sbin/jq` | Path to jq; hooks no-op if missing |
+| `RECALL_BRAID_MAX_AGE` | `300` (seconds) | Freshness gate on the braid correlator. Tool errors older than this when the next user prompt arrives are dropped. Default raised from 60s in v0.4.3 to cover interactive read+type latency without sacrificing relevance. |
+
 ## Storage layout
 
 ```

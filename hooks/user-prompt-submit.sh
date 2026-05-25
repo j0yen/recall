@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# recall UserPromptSubmit hook (v0.4.2, *braid* correlator) — pair the
+# recall UserPromptSubmit hook (v0.4.3, *braid* correlator) — pair the
 # most recent error state from PostToolUseFailure with the prompt the
 # user just typed, and feed the joined event to `recall observe`. The
 # heuristic catalog needs `user_prompt_after` to fire; this is where
@@ -9,8 +9,12 @@
 #   ~/.cache/recall-braid/<session-id>/last-error.json
 #
 # Read-then-delete pattern: the same error never pairs with two
-# subsequent prompts. Freshness gate: errors older than 60s are
-# treated as expired and discarded.
+# subsequent prompts. Freshness gate: errors older than MAX_AGE_SEC
+# (default 300s = 5min) are treated as expired and discarded.
+# Override with $RECALL_BRAID_MAX_AGE. The default was 60s in v0.4.1-
+# v0.4.2 but human read+type latency on interactive sessions routinely
+# exceeded that, silently dropping the join. 300s covers the realistic
+# read-then-reply window while staying under the prompt-cache TTL.
 #
 # session_id comes from the input JSON's `.session_id` field (what the
 # harness actually passes); v0.4.1 read it from $CLAUDE_SESSION_ID
@@ -26,7 +30,7 @@ exec 2>/dev/null
 
 RECALL_BIN="${RECALL_BIN:-$HOME/.local/bin/recall}"
 JQ="${JQ:-/usr/sbin/jq}"
-MAX_AGE_SEC="${RECALL_BRAID_MAX_AGE:-60}"
+MAX_AGE_SEC="${RECALL_BRAID_MAX_AGE:-300}"
 
 [ -x "$RECALL_BIN" ] || exit 0
 [ -x "$JQ" ] || exit 0
