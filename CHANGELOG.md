@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.4.2 — 2026-05-25
+
+Fix the braid correlator hooks: v0.4.1 read `$CLAUDE_SESSION_ID` from
+env, but the Claude Code harness passes session id in the input JSON's
+`.session_id` field, not as an env var — so both hooks silently no-op'd
+on every fire and zero proposals ever landed. v0.4.2 reads `.session_id`
+from the JSON payload first, with `$CLAUDE_SESSION_ID` as a fallback for
+forward-compat. No binary code changes; pure hook-script fix.
+
+Verified end-to-end this session: synthetic invocation against the hooks
+with real harness-shaped JSON now writes the state file and produces a
+proposal when paired with corrective language in the next prompt.
+
 ## v0.4.1 — 2026-05-25
 
 

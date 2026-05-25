@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# recall UserPromptSubmit hook (v0.4.1, *braid* correlator) — pair the
+# recall UserPromptSubmit hook (v0.4.2, *braid* correlator) — pair the
 # most recent error state from PostToolUseFailure with the prompt the
 # user just typed, and feed the joined event to `recall observe`. The
 # heuristic catalog needs `user_prompt_after` to fire; this is where
@@ -12,6 +12,11 @@
 # subsequent prompts. Freshness gate: errors older than 60s are
 # treated as expired and discarded.
 #
+# session_id comes from the input JSON's `.session_id` field (what the
+# harness actually passes); v0.4.1 read it from $CLAUDE_SESSION_ID
+# which the harness does not export — silent total no-op. v0.4.2 reads
+# JSON first, env as fallback.
+#
 # This hook runs on the latency-sensitive UserPromptSubmit path.
 # Total wall-budget target: < 200ms. Failure here must never block
 # the prompt — silent exit on every error path.
@@ -21,19 +26,22 @@ exec 2>/dev/null
 
 RECALL_BIN="${RECALL_BIN:-$HOME/.local/bin/recall}"
 JQ="${JQ:-/usr/sbin/jq}"
-SESSION_ID="${CLAUDE_SESSION_ID:-}"
 MAX_AGE_SEC="${RECALL_BRAID_MAX_AGE:-60}"
 
 [ -x "$RECALL_BIN" ] || exit 0
 [ -x "$JQ" ] || exit 0
+
+# Read the harness payload (the prompt) before we touch state, so a
+# parse error doesn't leave stale state behind.
+raw="$(cat -)"
+
+SESSION_ID="$("$JQ" -r '.session_id // empty' <<<"$raw" 2>/dev/null)"
+SESSION_ID="${SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 [ -n "$SESSION_ID" ] || exit 0
 
 state_file="$HOME/.cache/recall-braid/$SESSION_ID/last-error.json"
 [ -f "$state_file" ] || exit 0
 
-# Read the harness payload (the prompt) before we touch state, so a
-# parse error doesn't leave stale state behind.
-raw="$(cat -)"
 prompt="$("$JQ" -r '.prompt // .user_prompt // empty' <<<"$raw" 2>/dev/null)"
 
 # Always clear state — read-then-delete, even if the prompt was empty
