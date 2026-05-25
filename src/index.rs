@@ -7,8 +7,11 @@ use crate::embeddings;
 use crate::memory::Memory;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub struct Index {
     conn: Connection,
@@ -27,6 +30,24 @@ pub struct Hit {
     pub last_recalled_at: Option<DateTime<Utc>>,
 }
 
+/// Subset of `memories_meta` columns useful outside ranked search — what
+/// `doctor`/`stats`/`gc`/`update` need without going through FTS5.
+#[derive(Debug, Clone)]
+pub struct MetaRow {
+    pub id: String,
+    pub kind: String,
+    pub subject: String,
+    pub path: PathBuf,
+    pub confidence: f64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub last_recalled_at: Option<DateTime<Utc>>,
+    pub recall_count: u32,
+    pub decays_after: Option<String>,
+    pub supersedes: Vec<String>,
+    pub embedding_id: Option<String>,
+}
+
 impl Index {
     pub fn open(db_path: &Path) -> Result<Self> {
         if let Some(parent) = db_path.parent() {
@@ -34,9 +55,18 @@ impl Index {
         }
         let conn = Connection::open(db_path)
             .with_context(|| format!("open sqlite at {}", db_path.display()))?;
+        // Concurrency + safety pragmas (PRD §4b.11).
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA foreign_keys=ON;",
+        )?;
         conn.execute_batch(SCHEMA)?;
+        migrate(&conn)?;
         Ok(Self { conn })
     }
+
 
     /// Insert or replace the index entry for a memory. `embedding` is optional;
     /// pass `Some((id, vec))` to also store an embedding for vector search.
@@ -79,13 +109,14 @@ impl Index {
         )?;
 
         self.conn.execute(
-            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind,
                subject = excluded.subject,
                path = excluded.path,
                confidence = excluded.confidence,
+               updated_at = excluded.updated_at,
                decays_after = excluded.decays_after,
                supersedes_json = excluded.supersedes_json,
                embedding = excluded.embedding,
@@ -98,6 +129,7 @@ impl Index {
                 path_str,
                 mem.front.confidence,
                 mem.front.created_at.to_rfc3339(),
+                mem.front.updated_at.map(|t| t.to_rfc3339()),
                 mem.front.last_recalled_at.map(|t| t.to_rfc3339()),
                 mem.front.recall_count,
                 mem.front.decays_after,
@@ -108,6 +140,78 @@ impl Index {
             ],
         )?;
         Ok(())
+    }
+
+    /// Look up the meta row for a single id.
+    pub fn get_meta(&self, id: &str) -> Result<Option<MetaRow>> {
+        let row = self.conn.query_row(
+            "SELECT id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding_id
+             FROM memories_meta WHERE id = ?1",
+            params![id],
+            row_to_meta,
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Stream every meta row (ordered newest-first).
+    pub fn all_meta(&self) -> Result<Vec<MetaRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding_id
+             FROM memories_meta
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_meta)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// IDs cited by *any* memory's `supersedes` list. These are the rows that
+    /// should be filtered out of default queries (PRD §4b.7).
+    pub fn superseded_ids(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT supersedes_json FROM memories_meta
+             WHERE supersedes_json IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut set = HashSet::new();
+        for r in rows {
+            let s = r?;
+            if let Ok(ids) = serde_json::from_str::<Vec<String>>(&s) {
+                for id in ids {
+                    set.insert(id);
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    /// Memory ids that have `decays_after = <duration>` whose deadline has
+    /// passed (relative to `created_at`). `never` is preserved forever.
+    pub fn decayed_ids(&self) -> Result<HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, decays_after FROM memories_meta
+             WHERE decays_after IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let created: String = r.get(1)?;
+            let decay: String = r.get(2)?;
+            Ok((id, created, decay))
+        })?;
+        let now = Utc::now();
+        let mut set = HashSet::new();
+        for r in rows {
+            let (id, created, decay) = r?;
+            if let Some(deadline) = decay_deadline(&created, &decay) {
+                if now > deadline {
+                    set.insert(id);
+                }
+            }
+        }
+        Ok(set)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
@@ -272,16 +376,24 @@ impl Index {
     }
 
     /// Bump `last_recalled_at = now` and increment `recall_count`. Called after a successful query.
-    pub fn touch_recall(&self, id: &str) -> Result<()> {
+    pub fn touch_recall(&self, id: &str) -> Result<u32> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let n = self.conn.execute(
             "UPDATE memories_meta
              SET recall_count = recall_count + 1,
                  last_recalled_at = ?1
              WHERE id = ?2",
             params![now, id],
         )?;
-        Ok(())
+        if n == 0 {
+            return Err(anyhow::anyhow!("memory id {id} not found"));
+        }
+        let count: i64 = self.conn.query_row(
+            "SELECT recall_count FROM memories_meta WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )?;
+        Ok(u32::try_from(count).unwrap_or(0))
     }
 
     pub fn count(&self) -> Result<usize> {
@@ -322,6 +434,7 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     path TEXT NOT NULL,
     confidence REAL NOT NULL DEFAULT 0.5,
     created_at TEXT NOT NULL,
+    updated_at TEXT,
     last_recalled_at TEXT,
     recall_count INTEGER NOT NULL DEFAULT 0,
     decays_after TEXT,
@@ -331,10 +444,129 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     embedding_dim INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_meta_subject ON memories_meta(subject);
 CREATE INDEX IF NOT EXISTS idx_meta_kind    ON memories_meta(kind);
 CREATE INDEX IF NOT EXISTS idx_meta_created ON memories_meta(created_at);
 ";
+
+/// Apply additive migrations for stores written by older recall versions.
+/// Idempotent: `ALTER TABLE` errors that mean "column already exists" are
+/// treated as success.
+fn migrate(conn: &Connection) -> Result<()> {
+    let existing: u32 = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    if existing < 2 {
+        // v0.1 stores predate `updated_at`. CREATE TABLE above now has it, but
+        // existing tables don't — add it. Same shape for any v0.2 additive cols.
+        add_column_if_missing(conn, "memories_meta", "updated_at", "TEXT")?;
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?1)",
+        params![SCHEMA_VERSION.to_string()],
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(conn: &Connection, table: &str, col: &str, typ: &str) -> Result<()> {
+    let exists = column_exists(conn, table, col)?;
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {col} {typ}"), [])?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    for r in rows {
+        if r? == col {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<MetaRow> {
+    let created: String = row.get(5)?;
+    let updated: Option<String> = row.get(6)?;
+    let last: Option<String> = row.get(7)?;
+    let supersedes_json: Option<String> = row.get(10)?;
+    let supersedes = supersedes_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+        .unwrap_or_default();
+    Ok(MetaRow {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        subject: row.get(2)?,
+        path: PathBuf::from(row.get::<_, String>(3)?),
+        confidence: row.get(4)?,
+        created_at: DateTime::parse_from_rfc3339(&created)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: updated.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }),
+        last_recalled_at: last.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|d| d.with_timezone(&Utc))
+        }),
+        recall_count: u32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+        decays_after: row.get(9)?,
+        supersedes,
+        embedding_id: row.get(11)?,
+    })
+}
+
+/// Parse a `decays_after` string like "30d", "6mo", "1y", "never".
+/// `never` returns `None` so the caller treats it as "no deadline".
+pub(crate) fn decay_deadline(created_at: &str, decays: &str) -> Option<DateTime<Utc>> {
+    let created = DateTime::parse_from_rfc3339(created_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let d = decays.trim();
+    if d.eq_ignore_ascii_case("never") || d.is_empty() {
+        return None;
+    }
+    let dur = parse_duration_phrase(d)?;
+    Some(created + dur)
+}
+
+fn parse_duration_phrase(s: &str) -> Option<chrono::Duration> {
+    let (num_part, suffix) = split_num_suffix(s)?;
+    let n: i64 = num_part.parse().ok()?;
+    match suffix {
+        "m" => Some(chrono::Duration::minutes(n)),
+        "h" => Some(chrono::Duration::hours(n)),
+        "d" => Some(chrono::Duration::days(n)),
+        "w" => Some(chrono::Duration::weeks(n)),
+        "mo" => Some(chrono::Duration::days(n.saturating_mul(30))),
+        "y" => Some(chrono::Duration::days(n.saturating_mul(365))),
+        _ => None,
+    }
+}
+
+fn split_num_suffix(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(|c: char| !c.is_ascii_digit() && c != '-')?;
+    Some((s.split_at(idx).0, s.split_at(idx).1))
+}
 
 /// Stub embedder used only so `rebuild_from` can call `.id()` when given a
 /// concrete `Option<&dyn Embedder>` that is `Some`. Never used as a real embedder.

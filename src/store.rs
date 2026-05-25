@@ -30,8 +30,17 @@ impl FileStore {
             fs::create_dir_all(parent)?;
         }
         let md = mem.to_markdown()?;
-        fs::write(&path, md).with_context(|| format!("write {}", path.display()))?;
+        write_atomic(&path, &md)?;
         Ok(path)
+    }
+
+    /// Overwrite an existing memory at `path` with the new contents, atomically.
+    /// Used by `recall update` so the id and existing file location are preserved.
+    #[allow(clippy::unused_self)]
+    pub fn overwrite(&self, path: &Path, mem: &Memory) -> Result<()> {
+        let md = mem.to_markdown()?;
+        write_atomic(path, &md)?;
+        Ok(())
     }
 
     #[allow(clippy::unused_self)]
@@ -78,6 +87,42 @@ impl FileStore {
                 Ok((mem, e.path().to_path_buf()))
             })
     }
+
+    /// Walk every `*.md` under `memories/` and return `(id, path)` pairs
+    /// without parsing frontmatter. Used by `doctor` to detect orphans cheaply.
+    pub fn iter_ids(&self) -> impl Iterator<Item = (String, PathBuf)> + '_ {
+        WalkDir::new(paths::memories_dir(&self.root))
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_type().is_file()
+                    && e.path().extension().is_some_and(|x| x == "md")
+            })
+            .filter_map(|e| {
+                let stem = e.path().file_stem()?.to_str()?.to_string();
+                Some((stem, e.path().to_path_buf()))
+            })
+    }
+}
+
+/// Write `contents` to `path` atomically: write to a sibling temp file then
+/// rename. On POSIX, rename is atomic within the same filesystem, so readers
+/// either see the old contents or the full new contents — never a partial write.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("path {} has no parent", path.display()))?;
+    fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("path {} has no file name", path.display()))?
+        .to_string_lossy()
+        .to_string();
+    let tmp = dir.join(format!(".{file_name}.tmp"));
+    fs::write(&tmp, contents).with_context(|| format!("write tempfile {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

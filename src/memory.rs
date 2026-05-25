@@ -96,6 +96,8 @@ pub struct Frontmatter {
     pub confidence: f64,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_recalled_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub recall_count: u32,
@@ -127,6 +129,7 @@ impl Memory {
                 evidence: Vec::new(),
                 confidence: default_confidence(),
                 created_at: Utc::now(),
+                updated_at: None,
                 last_recalled_at: None,
                 recall_count: 0,
                 supersedes: Vec::new(),
