@@ -6,6 +6,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
 use recall::config::Config;
+use recall::daemon;
 use recall::embeddings::EmbedderKind;
 use recall::index::{Index, MetaRow};
 use recall::memory::{Evidence, Kind, Memory, Subject};
@@ -282,6 +283,29 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+
+    /// Recall daemon lifecycle. v0.5.0 ships `status` only; start/stop/
+    /// restart land in iter-5 (use systemd-user `recalld.service` in
+    /// the meantime).
+    Daemon {
+        #[command(subcommand)]
+        op: DaemonOp,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonOp {
+    /// Ping the daemon's UDS and print `model_id`, `uptime_s`, version.
+    /// Exit code 0 if a live daemon answered, 1 if the socket is absent
+    /// or unresponsive (so shell scripts can branch on it cheaply).
+    Status {
+        /// Override the socket path. Defaults to
+        /// `$XDG_RUNTIME_DIR/recall.sock` (or `~/.cache/recall/recall.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -477,7 +501,96 @@ fn main() -> Result<()> {
             if let Some(p) = &project_subject {
                 println!("project_subject: {p}");
             }
+            if let Ok(sock) = daemon::default_socket_path() {
+                let alive = sock.exists() && ping_socket_sync(&sock).is_ok();
+                println!(
+                    "socket: {} ({})",
+                    sock.display(),
+                    if alive { "alive" } else { "absent" }
+                );
+            }
             Ok(())
+        }
+        Command::Daemon { op } => cmd_daemon(op),
+    }
+}
+
+/// Blocking helper: spin a single-threaded tokio runtime and send a
+/// `ping` op over UDS. Returned `serde_json::Value` is the daemon's
+/// `{ok: {...}}` body on success, or an `Err` if the socket is dead
+/// or the response was malformed.
+fn ping_socket_sync(socket: &std::path::Path) -> Result<serde_json::Value> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build current-thread tokio runtime for daemon ping")?;
+    let req = serde_json::json!({ "op": "ping", "args": {} });
+    let resp = rt.block_on(daemon::client_roundtrip(socket, &req))?;
+    if let Some(ok) = resp.get("ok") {
+        Ok(ok.clone())
+    } else if let Some(err) = resp.get("error") {
+        Err(anyhow!("daemon ping returned error: {err}"))
+    } else {
+        Err(anyhow!("daemon ping returned malformed response: {resp}"))
+    }
+}
+
+fn cmd_daemon(op: DaemonOp) -> Result<()> {
+    match op {
+        DaemonOp::Status { socket, format } => {
+            let sock = match socket {
+                Some(s) => s,
+                None => daemon::default_socket_path()?,
+            };
+            match ping_socket_sync(&sock) {
+                Ok(body) => {
+                    if format == "json" {
+                        let out = serde_json::json!({
+                            "daemon_active": true,
+                            "socket": sock.display().to_string(),
+                            "model_id": body.get("model_id"),
+                            "uptime_s": body.get("uptime_s"),
+                            "query_count": body.get("query_count"),
+                            "version": body.get("version"),
+                            "root": body.get("root"),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!("daemon_active: true");
+                        println!("socket: {}", sock.display());
+                        if let Some(v) = body.get("model_id").and_then(|x| x.as_str()) {
+                            println!("model_id: {v}");
+                        }
+                        if let Some(v) = body.get("uptime_s").and_then(|x| x.as_u64()) {
+                            println!("uptime_s: {v}");
+                        }
+                        if let Some(v) = body.get("query_count").and_then(|x| x.as_u64()) {
+                            println!("query_count: {v}");
+                        }
+                        if let Some(v) = body.get("version").and_then(|x| x.as_str()) {
+                            println!("version: {v}");
+                        }
+                        if let Some(v) = body.get("root").and_then(|x| x.as_str()) {
+                            println!("root: {v}");
+                        }
+                    }
+                    Ok(())
+                }
+                Err(_e) => {
+                    if format == "json" {
+                        let out = serde_json::json!({
+                            "daemon_active": false,
+                            "socket": sock.display().to_string(),
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        println!("daemon_active: false");
+                        println!("socket: {}", sock.display());
+                    }
+                    // Exit non-zero so shell scripts can branch on the absence.
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

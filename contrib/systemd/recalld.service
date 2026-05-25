@@ -1,0 +1,22 @@
+[Unit]
+Description=recall daemon (warm in-process embedder + UDS retrieval)
+Documentation=https://github.com/j0yen/recall
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/recalld
+Restart=on-failure
+RestartSec=2s
+# Keep the daemon resident; SIGTERM triggers graceful socket unlink.
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+# Soft memory ceiling — fastembed BGE-small is ~130MB; leave headroom.
+MemoryHigh=512M
+MemoryMax=768M
+# Inherit XDG_RUNTIME_DIR so default_socket_path() resolves to the
+# user runtime dir (the same path the CLI checks).
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target
