@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.5.0 — 2026-05-25
+
+`recalld` long-lived daemon ships. Loads the fastembed BGE-small ONNX
+model once at startup, listens on `$XDG_RUNTIME_DIR/recall.sock` (or
+`~/.cache/recall/recall.sock` fallback), and answers length-prefixed
+JSON requests over UDS. Ops in v1: `ping`, `query`, `embed`, `touch`.
+
+The CLI auto-forwards filter-free `recall query` invocations to the
+socket when present, silently falling back to in-process retrieval when
+the daemon is down or the request bears filters the v0.5.0 daemon `query`
+op doesn't yet expose. `recall daemon status [--format text|json]`
+reports model_id / uptime / version / root over the same protocol;
+`recall where` adds a `daemon_active` liveness line.
+
+Includes a `contrib/systemd/recalld.service` user unit and
+`contrib/systemd/README.md` install notes. SIGINT/SIGTERM trigger
+graceful shutdown. Subsumes `PRD-recall-observer-correlation.md`
+state-file correlator for the warm path; cold path is unchanged.
+
 ## v0.4.3 — 2026-05-25
 
 Raise the braid freshness gate default from 60s to 300s so human-paced
