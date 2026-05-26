@@ -50,13 +50,26 @@ pub fn classify(ev: &Event) -> Option<Proposal> {
     if ev.status.eq_ignore_ascii_case("error") {
         if let Some(p) = ev.user_prompt_after.as_deref() {
             if has_corrective_language(p) {
-                return Some(Proposal {
-                    body: format!(
-                        "{} call failed and the user corrected with: {:?}\n\nTool error: {}",
-                        ev.tool_name,
-                        first_n_chars(p, 200),
+                let preface = format!(
+                    "{} call failed and the user corrected with: {:?}",
+                    ev.tool_name,
+                    first_n_chars(p, 200),
+                );
+                let body = if is_empty_response(&ev.tool_response) {
+                    let signal = extract_input_signal(&ev.tool_input);
+                    if signal.is_empty() {
+                        format!("{preface}\n\nTool: {}", ev.tool_name)
+                    } else {
+                        format!("{preface}\n\nTool: {}\nInput: {}", ev.tool_name, signal)
+                    }
+                } else {
+                    format!(
+                        "{preface}\n\nTool error: {}",
                         first_n_chars(&ev.tool_response.to_string(), 400),
-                    ),
+                    )
+                };
+                return Some(Proposal {
+                    body,
                     kind: Kind::Reflective,
                     subject: Subject::self_(),
                     reason: "tool error followed by corrective user prompt".into(),
@@ -72,6 +85,30 @@ pub fn classify(ev: &Event) -> Option<Proposal> {
     // single-event signals above.
 
     None
+}
+
+/// True when `tool_response` carries no information the user could read —
+/// null, empty object, or empty string. Harness Bash failures arrive here.
+fn is_empty_response(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(m) => m.is_empty(),
+        serde_json::Value::String(s) => s.is_empty(),
+        _ => false,
+    }
+}
+
+/// Fallback signal when `tool_response` is empty. Priority: Bash command,
+/// then Edit/Read/Write file_path, then any free-form description.
+fn extract_input_signal(input: &serde_json::Value) -> String {
+    for key in ["command", "file_path", "description"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return first_n_chars(s, 400);
+            }
+        }
+    }
+    String::new()
 }
 
 fn has_corrective_language(prompt: &str) -> bool {
@@ -186,6 +223,56 @@ mod tests {
             user_prompt_after: None,
         };
         assert!(classify(&ev).is_none());
+    }
+
+    #[test]
+    fn bash_failure_empty_response_includes_command() {
+        let ev = Event {
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({"command": "rm -rf /tmp/foo", "description": "remove"}),
+            tool_response: serde_json::json!({}),
+            status: "error".into(),
+            user_prompt_after: Some("no wait that's wrong".into()),
+        };
+        let p = classify(&ev).expect("should propose");
+        assert!(p.body.contains("Tool: Bash"), "body: {}", p.body);
+        assert!(
+            p.body.contains("Input: rm -rf /tmp/foo"),
+            "body: {}",
+            p.body
+        );
+        assert!(!p.body.contains("Tool error:"), "body: {}", p.body);
+    }
+
+    #[test]
+    fn edit_failure_empty_response_includes_file_path() {
+        let ev = Event {
+            tool_name: "Edit".into(),
+            tool_input: serde_json::json!({"file_path": "/home/jsy/foo.rs"}),
+            tool_response: serde_json::Value::Null,
+            status: "error".into(),
+            user_prompt_after: Some("undo that".into()),
+        };
+        let p = classify(&ev).expect("should propose");
+        assert!(
+            p.body.contains("Input: /home/jsy/foo.rs"),
+            "body: {}",
+            p.body
+        );
+    }
+
+    #[test]
+    fn tool_input_without_known_keys_drops_input_line() {
+        let ev = Event {
+            tool_name: "SomeTool".into(),
+            tool_input: serde_json::json!({"other": "thing"}),
+            tool_response: serde_json::Value::Null,
+            status: "error".into(),
+            user_prompt_after: Some("actually never mind".into()),
+        };
+        let p = classify(&ev).expect("should propose");
+        assert!(!p.body.contains("Input:"), "body: {}", p.body);
+        assert!(p.body.contains("Tool: SomeTool"), "body: {}", p.body);
     }
 
     #[test]
