@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.5.2 — 2026-05-26
+
+`recall daemon start`, `daemon stop`, and `daemon restart` ship as
+first-class subcommands. `start` forks `recalld` into the background by
+default (writing a pidfile under `$XDG_RUNTIME_DIR/recall.pid`, or
+`~/.cache/recall/recall.pid` fallback) and supports `--foreground` for
+systemd `Type=simple` integration. `stop` sends `SIGTERM` and gates
+on socket disappearance via `--wait-secs`; `restart` chains the two.
+
+`recall doctor --format json` now reports `daemon_active` (bool) and
+`daemon_uptime_s` (u64), probed via `ping_socket_sync` against the live
+daemon when present. Closes the last gap on PRD-recall-daemon §5 (AC1
+cold-start subcommand path, AC4 doctor liveness, AC6 SIGKILL+restart).
+
+No protocol or storage changes. Pidfile handling is atomic — `recalld`
+removes the pidfile on graceful exit, and `daemon start` refuses to
+launch if a live pid is already listening on the socket.
+
+## v0.5.1 — 2026-05-25
+
+Fix the recall Stop-hook session_id source: like the braid hooks before
+the v0.4.2 fix, the Stop hook was reading `$CLAUDE_SESSION_ID` from env,
+but the harness passes session id in the JSON payload's `.session_id`
+field. Hook now reads from JSON first with the env var as fallback.
+No binary change; hook-script-only fix.
+
 ## v0.5.0 — 2026-05-25
 
 `recalld` long-lived daemon ships. Loads the fastembed BGE-small ONNX
