@@ -37,10 +37,14 @@ fn parse_embedder_override(args: &[String]) -> Option<String> {
     parse_value_flag(args, "--embedder")
 }
 
+fn parse_pidfile_override(args: &[String]) -> Option<PathBuf> {
+    parse_value_flag(args, "--pidfile").map(PathBuf::from)
+}
+
 fn print_help() {
     eprintln!("recalld v{} — recall daemon", env!("CARGO_PKG_VERSION"));
     eprintln!(
-        "Usage: recalld [--socket PATH] [--root PATH] [--embedder hash|fastembed] [--help]"
+        "Usage: recalld [--socket PATH] [--root PATH] [--embedder hash|fastembed] [--pidfile PATH] [--help]"
     );
     eprintln!();
     eprintln!("Listens on a Unix-domain socket and serves recall ops to");
@@ -48,6 +52,7 @@ fn print_help() {
     eprintln!("shutdown that removes the socket file.");
     eprintln!();
     eprintln!("Default socket:   $XDG_RUNTIME_DIR/recall.sock");
+    eprintln!("Default pidfile:  $XDG_RUNTIME_DIR/recall.pid (next to socket)");
     eprintln!("Default root:     ~/.claude/recall  (per `recall where`)");
     eprintln!("Default embedder: fastembed");
     eprintln!("Wire ops:         {}", daemon::OPS.join(", "));
@@ -93,6 +98,17 @@ fn main() -> ExitCode {
         None => EmbedderKind::Fastembed,
     };
 
+    let pidfile = match parse_pidfile_override(&args) {
+        Some(p) => p,
+        None => match daemon::pid_path_for_socket(&sock) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("recalld: cannot resolve pidfile path: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
     let state = match DaemonState::open(root.clone(), embedder_kind) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -100,6 +116,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if let Err(e) = write_pidfile(&pidfile) {
+        eprintln!("recalld: cannot write pidfile {}: {e}", pidfile.display());
+        return ExitCode::from(2);
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -144,6 +165,8 @@ fn main() -> ExitCode {
         daemon::run_server(state, sock_for_log, shutdown).await
     });
 
+    let _ = std::fs::remove_file(&pidfile);
+
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -151,4 +174,16 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn write_pidfile(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let tmp = path.with_extension("pid.tmp");
+    std::fs::write(&tmp, format!("{}\n", std::process::id()))?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }

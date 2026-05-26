@@ -284,9 +284,7 @@ enum Command {
         format: String,
     },
 
-    /// Recall daemon lifecycle. v0.5.0 ships `status` only; start/stop/
-    /// restart land in iter-5 (use systemd-user `recalld.service` in
-    /// the meantime).
+    /// Recall daemon lifecycle.
     Daemon {
         #[command(subcommand)]
         op: DaemonOp,
@@ -305,6 +303,52 @@ enum DaemonOp {
         socket: Option<PathBuf>,
         #[arg(long, default_value = "text")]
         format: String,
+    },
+    /// Start a `recalld` instance. By default detaches into the
+    /// background and writes the PID file alongside the socket; with
+    /// `--foreground` blocks until shutdown (suitable for systemd Type=simple).
+    Start {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        embedder: Option<String>,
+        /// Run in the foreground (do not fork). The CLI execs into
+        /// `recalld`; SIGTERM/SIGINT shut it down cleanly.
+        #[arg(long)]
+        foreground: bool,
+        /// Override the pidfile path. Defaults to `recall.pid` in the
+        /// socket's parent directory.
+        #[arg(long)]
+        pidfile: Option<PathBuf>,
+    },
+    /// Stop a running `recalld` by reading its pidfile and sending
+    /// SIGTERM, then waiting up to `--wait-secs` for the socket to
+    /// disappear. Exit 0 if the daemon stopped cleanly, 1 if it could
+    /// not be reached, 2 if it did not exit in time.
+    Stop {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        pidfile: Option<PathBuf>,
+        #[arg(long, default_value_t = 5)]
+        wait_secs: u64,
+    },
+    /// Stop the daemon (if running) and start a fresh one in the
+    /// background. Forwards `--socket`/`--root`/`--embedder` to the
+    /// new instance.
+    Restart {
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        embedder: Option<String>,
+        #[arg(long)]
+        pidfile: Option<PathBuf>,
+        #[arg(long, default_value_t = 5)]
+        wait_secs: u64,
     },
 }
 
@@ -702,6 +746,236 @@ fn cmd_daemon(op: DaemonOp) -> Result<()> {
                 }
             }
         }
+        DaemonOp::Start {
+            socket,
+            root,
+            embedder,
+            foreground,
+            pidfile,
+        } => {
+            let sock = match socket {
+                Some(s) => s,
+                None => daemon::default_socket_path()?,
+            };
+            let pid = match pidfile {
+                Some(p) => p,
+                None => daemon::pid_path_for_socket(&sock)?,
+            };
+            if pid_alive(&pid) && sock.exists() && ping_socket_sync(&sock).is_ok() {
+                eprintln!("recalld already running (pidfile {})", pid.display());
+                return Ok(());
+            }
+            cmd_daemon_start(&sock, root.as_deref(), embedder.as_deref(), foreground, &pid)
+        }
+        DaemonOp::Stop {
+            socket,
+            pidfile,
+            wait_secs,
+        } => {
+            let sock = match socket {
+                Some(s) => s,
+                None => daemon::default_socket_path()?,
+            };
+            let pid = match pidfile {
+                Some(p) => p,
+                None => daemon::pid_path_for_socket(&sock)?,
+            };
+            cmd_daemon_stop(&sock, &pid, wait_secs)
+        }
+        DaemonOp::Restart {
+            socket,
+            root,
+            embedder,
+            pidfile,
+            wait_secs,
+        } => {
+            let sock = match socket {
+                Some(s) => s,
+                None => daemon::default_socket_path()?,
+            };
+            let pid = match pidfile {
+                Some(p) => p,
+                None => daemon::pid_path_for_socket(&sock)?,
+            };
+            // Stop best-effort; ignore "not running" so restart works
+            // when nothing is up yet.
+            let _ = cmd_daemon_stop(&sock, &pid, wait_secs);
+            cmd_daemon_start(&sock, root.as_deref(), embedder.as_deref(), false, &pid)
+        }
+    }
+}
+
+/// Resolve the `recalld` binary path. Honors `$RECALLD_BIN`, then looks
+/// next to the current `recall` executable, then falls back to `recalld`
+/// on `$PATH`.
+fn locate_recalld() -> PathBuf {
+    if let Ok(v) = std::env::var("RECALLD_BIN") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let cand = dir.join("recalld");
+            if cand.exists() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from("recalld")
+}
+
+/// Return true iff the pidfile exists, parses as a PID, and `/proc/<pid>`
+/// indicates a live process owned by this user.
+fn pid_alive(pidfile: &std::path::Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(pidfile) else {
+        return false;
+    };
+    let Ok(pid) = raw.trim().parse::<u32>() else {
+        return false;
+    };
+    pid_alive_raw(pid)
+}
+
+fn pid_alive_raw(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// Send a signal by spawning `/bin/kill`. Returns the exit status:
+/// 0 → delivered, 1 → no such process / no permission.
+fn send_signal(pid: u32, signal: &str) -> std::io::Result<std::process::ExitStatus> {
+    std::process::Command::new("/bin/kill")
+        .arg(signal)
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+}
+
+fn cmd_daemon_start(
+    socket: &std::path::Path,
+    root: Option<&std::path::Path>,
+    embedder: Option<&str>,
+    foreground: bool,
+    pidfile: &std::path::Path,
+) -> Result<()> {
+    let bin = locate_recalld();
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--socket").arg(socket);
+    cmd.arg("--pidfile").arg(pidfile);
+    if let Some(r) = root {
+        cmd.arg("--root").arg(r);
+    }
+    if let Some(e) = embedder {
+        cmd.arg("--embedder").arg(e);
+    }
+
+    if foreground {
+        // Block in the foreground so signals reach this process and
+        // recalld's child stdio inherits our terminal. Useful for
+        // systemd Type=simple or interactive debugging.
+        let status = cmd
+            .status()
+            .with_context(|| format!("spawn {}", bin.display()))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(anyhow!("recalld exited with status {status}"));
+    }
+
+    // Background: detach via setsid so the daemon survives the
+    // launching shell. stdin from /dev/null; stdout/stderr to a log file
+    // next to the socket. Use the `setsid(1)` utility for portability
+    // (avoids needing libc / unsafe blocks).
+    let log_path = socket.with_extension("log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open daemon log {}", log_path.display()))?;
+    let log_err = log
+        .try_clone()
+        .context("clone log fd for stderr")?;
+    let mut detach = std::process::Command::new("setsid");
+    detach.arg("--fork").arg(&bin);
+    detach.arg("--socket").arg(socket);
+    detach.arg("--pidfile").arg(pidfile);
+    if let Some(r) = root {
+        detach.arg("--root").arg(r);
+    }
+    if let Some(e) = embedder {
+        detach.arg("--embedder").arg(e);
+    }
+    detach
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    let status = detach
+        .status()
+        .with_context(|| format!("spawn setsid {}", bin.display()))?;
+    if !status.success() {
+        return Err(anyhow!(
+            "setsid recalld exited with status {status}; see {}",
+            log_path.display()
+        ));
+    }
+    // Wait briefly for the daemon to become responsive so the CLI exits
+    // with a useful status instead of returning before the socket is up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if socket.exists() && ping_socket_sync(socket).is_ok() {
+            let pid_str = std::fs::read_to_string(pidfile)
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            println!("recalld started (pid {pid_str}, socket {})", socket.display());
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "recalld did not respond on {} within 5s; see {}",
+                socket.display(),
+                log_path.display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn cmd_daemon_stop(
+    socket: &std::path::Path,
+    pidfile: &std::path::Path,
+    wait_secs: u64,
+) -> Result<()> {
+    let raw = match std::fs::read_to_string(pidfile) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("recalld not running (no pidfile at {})", pidfile.display());
+            std::process::exit(1);
+        }
+    };
+    let pid: u32 = raw
+        .trim()
+        .parse()
+        .with_context(|| format!("malformed pid in {}", pidfile.display()))?;
+    if !pid_alive_raw(pid) {
+        eprintln!("recalld pid {pid} not running; cleaning stale pidfile");
+        let _ = std::fs::remove_file(pidfile);
+        std::process::exit(1);
+    }
+    let status = send_signal(pid, "-TERM").context("invoke /bin/kill")?;
+    if !status.success() {
+        return Err(anyhow!("kill -TERM {pid}: exit {status}"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+    loop {
+        if !pid_alive_raw(pid) && !socket.exists() {
+            println!("recalld stopped (pid {pid})");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            std::process::exit(2);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -1378,6 +1652,14 @@ fn cmd_doctor(
         .collect();
     let model_path = fastembed_model_dir();
 
+    let (daemon_active, daemon_uptime_s) = match daemon::default_socket_path() {
+        Ok(sock) if sock.exists() => match ping_socket_sync(&sock) {
+            Ok(body) => (true, body.get("uptime_s").and_then(|v| v.as_u64())),
+            Err(_) => (false, None),
+        },
+        _ => (false, None),
+    };
+
     if format == "json" {
         let obj = serde_json::json!({
             "files_on_disk": on_disk.len(),
@@ -1396,6 +1678,8 @@ fn cmd_doctor(
             "oldest_created_at": oldest.map(|t| t.to_rfc3339()),
             "newest_created_at": newest.map(|t| t.to_rfc3339()),
             "total_recall_count": total_recall,
+            "daemon_active": daemon_active,
+            "daemon_uptime_s": daemon_uptime_s,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
@@ -1428,6 +1712,14 @@ fn cmd_doctor(
             println!("newest        : {n}");
         }
         println!("total recalls : {total_recall}");
+        if daemon_active {
+            match daemon_uptime_s {
+                Some(s) => println!("daemon        : active (uptime {s}s)"),
+                None => println!("daemon        : active"),
+            }
+        } else {
+            println!("daemon        : inactive");
+        }
         if let Some(w) = &fs_warning {
             println!("fs warning    : {w}");
         }

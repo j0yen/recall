@@ -62,6 +62,35 @@ pub fn default_socket_path() -> Result<PathBuf> {
         .join("recall.sock"))
 }
 
+/// Default PID file path. Same directory as [`default_socket_path`], with
+/// a `recall.pid` filename so `recall daemon start/stop` can find the
+/// running `recalld` to signal.
+///
+/// # Errors
+/// Returns an error if the default socket directory cannot be resolved.
+pub fn default_pid_path() -> Result<PathBuf> {
+    let sock = default_socket_path()?;
+    let dir = sock
+        .parent()
+        .context("socket path has no parent dir")?
+        .to_path_buf();
+    Ok(dir.join("recall.pid"))
+}
+
+/// PID file location implied by a given socket path: same directory,
+/// `recall.pid` filename. Used so `--socket /tmp/x.sock` writes its PID
+/// to `/tmp/recall.pid` rather than colliding with the default daemon.
+///
+/// # Errors
+/// Returns an error if the socket path has no parent directory.
+pub fn pid_path_for_socket(socket: &std::path::Path) -> Result<PathBuf> {
+    let dir = socket
+        .parent()
+        .context("socket path has no parent dir")?
+        .to_path_buf();
+    Ok(dir.join("recall.pid"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", content = "args", rename_all = "snake_case")]
 pub enum Request {
