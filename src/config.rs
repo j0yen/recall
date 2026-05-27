@@ -14,6 +14,7 @@ pub struct Config {
     pub weights: Weights,
     pub retrieval: Retrieval,
     pub embedder: EmbedderCfg,
+    pub feedback: Feedback,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -71,6 +72,28 @@ impl Default for EmbedderCfg {
     fn default() -> Self {
         Self {
             model: "fastembed".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Feedback {
+    pub accept_delta: f64,
+    pub reject_delta: f64,
+    pub ceiling: f64,
+    pub floor: f64,
+    pub half_life_d: u32,
+}
+
+impl Default for Feedback {
+    fn default() -> Self {
+        Self {
+            accept_delta: 0.02,
+            reject_delta: 0.10,
+            ceiling: 0.95,
+            floor: 0.05,
+            half_life_d: 90,
         }
     }
 }

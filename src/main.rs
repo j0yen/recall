@@ -289,6 +289,30 @@ enum Command {
         #[command(subcommand)]
         op: DaemonOp,
     },
+
+    /// Outcome feedback — bump or decay a memory's confidence based on
+    /// whether it helped or misled. See PRD-recall-outcome-feedback.
+    Feedback {
+        /// Memories to mark as helpful (raises confidence by `accept_delta`).
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        accept: Vec<String>,
+        /// Memories to mark as wrong (lowers confidence by `reject_delta`).
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        reject: Vec<String>,
+        /// Memories to explicitly abstain on — recorded as no-op feedback
+        /// (still increments `feedback_count`, leaves confidence unchanged).
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        abstain: Vec<String>,
+        /// Run the decay sweep across every memory after applying ids.
+        #[arg(long, default_value_t = false)]
+        decay_sweep: bool,
+        /// Minimum days between two decay sweeps of the same row
+        /// (idempotency gate). Default 1 — once-per-day.
+        #[arg(long, default_value_t = 1)]
+        min_interval_d: u32,
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -556,6 +580,24 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Daemon { op } => cmd_daemon(op),
+        Command::Feedback {
+            accept,
+            reject,
+            abstain,
+            decay_sweep,
+            min_interval_d,
+            format,
+        } => cmd_feedback(
+            &root,
+            &config,
+            accept,
+            reject,
+            abstain,
+            decay_sweep,
+            min_interval_d,
+            &format,
+            embedder_kind,
+        ),
     }
 }
 
@@ -1024,6 +1066,131 @@ fn cmd_init(root: &std::path::Path) -> Result<()> {
     let _idx = Index::open(&paths::index_db(root))?;
     println!("initialized {}", root.display());
     Ok(())
+}
+
+/// Apply outcome feedback to memories. Writes confidence + feedback_count
+/// to both SQLite and the on-disk markdown frontmatter so the file stays
+/// canonical.
+#[allow(clippy::too_many_arguments)]
+fn cmd_feedback(
+    root: &std::path::Path,
+    config: &Config,
+    accept: Vec<String>,
+    reject: Vec<String>,
+    abstain: Vec<String>,
+    decay_sweep: bool,
+    min_interval_d: u32,
+    format: &str,
+    _embedder_kind: EmbedderKind,
+) -> Result<()> {
+    if accept.is_empty() && reject.is_empty() && abstain.is_empty() && !decay_sweep {
+        return Err(anyhow!(
+            "feedback requires at least one of --accept, --reject, --abstain, or --decay-sweep"
+        ));
+    }
+    let store = FileStore::open(root.to_path_buf())?;
+    let idx = Index::open(&paths::index_db(root))?;
+    let cfg = &config.feedback;
+
+    #[derive(Debug)]
+    struct Outcome {
+        id: String,
+        op: &'static str,
+        new_confidence: Option<f64>,
+        feedback_count: Option<u32>,
+        error: Option<String>,
+    }
+
+    let mut results: Vec<Outcome> = Vec::new();
+
+    // accept = +accept_delta, reject = -reject_delta, abstain = 0.0 delta
+    // (still bumps feedback_count for observability).
+    let work: Vec<(String, &'static str, f64)> = accept
+        .into_iter()
+        .map(|id| (id, "accept", cfg.accept_delta))
+        .chain(reject.into_iter().map(|id| (id, "reject", -cfg.reject_delta)))
+        .chain(abstain.into_iter().map(|id| (id, "abstain", 0.0)))
+        .collect();
+
+    for (id, op, delta) in work {
+        match apply_feedback_one(&store, &idx, &id, delta, cfg) {
+            Ok((conf, n)) => results.push(Outcome {
+                id,
+                op,
+                new_confidence: Some(conf),
+                feedback_count: Some(n),
+                error: None,
+            }),
+            Err(e) => results.push(Outcome {
+                id,
+                op,
+                new_confidence: None,
+                feedback_count: None,
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+
+    let sweep_count = if decay_sweep {
+        Some(idx.apply_decay_sweep(cfg.half_life_d, min_interval_d)?)
+    } else {
+        None
+    };
+
+    if format == "json" {
+        let arr: Vec<serde_json::Value> = results
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "id": o.id,
+                    "op": o.op,
+                    "confidence": o.new_confidence,
+                    "feedback_count": o.feedback_count,
+                    "error": o.error,
+                })
+            })
+            .collect();
+        let obj = serde_json::json!({
+            "results": arr,
+            "decay_sweep_updated": sweep_count,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        for o in &results {
+            match (&o.new_confidence, &o.error) {
+                (Some(c), _) => println!(
+                    "{}  {}  conf={:.3}  feedback_count={}",
+                    o.id,
+                    o.op,
+                    c,
+                    o.feedback_count.unwrap_or(0)
+                ),
+                (None, Some(e)) => println!("{}  {}  ERROR: {}", o.id, o.op, e),
+                (None, None) => println!("{}  {}  (no change)", o.id, o.op),
+            }
+        }
+        if let Some(n) = sweep_count {
+            println!("decay sweep   : {n} rows updated");
+        }
+    }
+    Ok(())
+}
+
+fn apply_feedback_one(
+    store: &FileStore,
+    idx: &Index,
+    id: &str,
+    delta: f64,
+    cfg: &recall::config::Feedback,
+) -> Result<(f64, u32)> {
+    let (new_conf, new_count) = idx.apply_feedback_delta(id, delta, cfg)?;
+    // Mirror to the markdown file so the file stays the source of truth.
+    let (mut mem, path) = store.find_by_id(id)?;
+    mem.front.confidence = new_conf;
+    mem.front.feedback_count = new_count;
+    mem.front.updated_at = Some(Utc::now());
+    store.overwrite(&path, &mem)?;
+    Ok((new_conf, new_count))
 }
 
 fn cmd_write(

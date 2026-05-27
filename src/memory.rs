@@ -101,6 +101,8 @@ pub struct Frontmatter {
     pub last_recalled_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub recall_count: u32,
+    #[serde(default)]
+    pub feedback_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +134,7 @@ impl Memory {
                 updated_at: None,
                 last_recalled_at: None,
                 recall_count: 0,
+                feedback_count: 0,
                 supersedes: Vec::new(),
                 decays_after: None,
             },

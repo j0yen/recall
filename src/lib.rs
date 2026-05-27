@@ -13,6 +13,7 @@
 pub mod config;
 pub mod daemon;
 pub mod embeddings;
+pub mod feedback;
 pub mod index;
 pub mod memory;
 pub mod observer;

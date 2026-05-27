@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Read the persisted schema_version row. Returns None if the row is missing
 /// (which means the store predates `schema_meta`).
@@ -126,8 +126,8 @@ impl Index {
         )?;
 
         self.conn.execute(
-            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim, feedback_count, confidence_at_create)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind,
                subject = excluded.subject,
@@ -138,7 +138,8 @@ impl Index {
                supersedes_json = excluded.supersedes_json,
                embedding = excluded.embedding,
                embedding_id = excluded.embedding_id,
-               embedding_dim = excluded.embedding_dim",
+               embedding_dim = excluded.embedding_dim,
+               feedback_count = excluded.feedback_count",
             params![
                 mem.front.id,
                 mem.front.kind.as_str(),
@@ -154,9 +155,150 @@ impl Index {
                 embed_blob,
                 embed_id,
                 embed_dim,
+                mem.front.feedback_count,
+                mem.front.confidence,
             ],
         )?;
         Ok(())
+    }
+
+    /// Apply a feedback delta to a memory's confidence (clamped to
+    /// `[floor, ceiling]`) and increment `feedback_count`. Writes both the
+    /// `memories_meta` row AND the on-disk Markdown frontmatter so the
+    /// file remains the source of truth.
+    ///
+    /// Returns the new `(confidence, feedback_count)` tuple.
+    pub fn apply_feedback_delta(
+        &self,
+        id: &str,
+        delta: f64,
+        cfg: &crate::config::Feedback,
+    ) -> Result<(f64, u32)> {
+        let current: (f64, i64) = self
+            .conn
+            .query_row(
+                "SELECT confidence, feedback_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        let new_conf = crate::feedback::apply_delta(current.0, delta, cfg);
+        let new_count = current.1.saturating_add(1);
+        self.conn.execute(
+            "UPDATE memories_meta
+             SET confidence = ?1,
+                 feedback_count = ?2,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![new_conf, new_count, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok((new_conf, u32::try_from(new_count).unwrap_or(u32::MAX)))
+    }
+
+    /// Apply a decay sweep across every memory. Idempotent within
+    /// `min_interval_d` days: if `last_decay_sweep_at` for a row is more
+    /// recent than `min_interval_d` days ago, that row is skipped.
+    ///
+    /// Returns the number of rows updated.
+    pub fn apply_decay_sweep(
+        &self,
+        half_life_d: u32,
+        min_interval_d: u32,
+    ) -> Result<usize> {
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let min_interval_secs = i64::from(min_interval_d) * 86400;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, confidence, last_decay_sweep_at, created_at FROM memories_meta",
+        )?;
+        struct Row {
+            id: String,
+            confidence: f64,
+            last_sweep: Option<String>,
+            created_at: String,
+        }
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    confidence: r.get(1)?,
+                    last_sweep: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let mut updated = 0usize;
+        for row in rows {
+            // Idempotency gate: skip if last sweep is within min_interval_d.
+            if let Some(last) = &row.last_sweep {
+                if let Ok(t) = DateTime::parse_from_rfc3339(last) {
+                    let elapsed = now.signed_duration_since(t.with_timezone(&Utc)).num_seconds();
+                    if elapsed < min_interval_secs {
+                        continue;
+                    }
+                }
+            }
+            // Days since last sweep (or since creation if never swept).
+            let baseline_str = row.last_sweep.as_deref().unwrap_or(row.created_at.as_str());
+            let baseline = DateTime::parse_from_rfc3339(baseline_str)
+                .ok()
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or(now);
+            let days = (now.signed_duration_since(baseline).num_seconds() as f64) / 86400.0;
+            let new_conf = crate::feedback::decay_toward_neutral(row.confidence, days, half_life_d);
+            self.conn.execute(
+                "UPDATE memories_meta
+                 SET confidence = ?1,
+                     last_decay_sweep_at = ?2
+                 WHERE id = ?3",
+                params![new_conf, now_str, row.id],
+            )?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    /// Look up `feedback_count` for a single id (used by tests + observability).
+    pub fn get_feedback_count(&self, id: &str) -> Result<u32> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT feedback_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        Ok(u32::try_from(n).unwrap_or(0))
+    }
+
+    /// List `(id, drift)` for memories whose confidence has moved
+    /// `>= threshold` from `confidence_at_create`. Used by `recall doctor`.
+    pub fn confidence_drift(&self, threshold: f64) -> Result<Vec<(String, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, confidence, confidence_at_create
+             FROM memories_meta
+             WHERE confidence_at_create IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, conf, base) = row?;
+            let drift = conf - base;
+            if drift.abs() >= threshold {
+                out.push((id, drift));
+            }
+        }
+        Ok(out)
     }
 
     /// Look up the meta row for a single id.
@@ -458,7 +600,10 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     supersedes_json TEXT,
     embedding BLOB,
     embedding_id TEXT,
-    embedding_dim INTEGER
+    embedding_dim INTEGER,
+    feedback_count INTEGER NOT NULL DEFAULT 0,
+    confidence_at_create REAL,
+    last_decay_sweep_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -489,6 +634,28 @@ fn migrate(conn: &Connection) -> Result<()> {
         // v0.1 stores predate `updated_at`. CREATE TABLE above now has it, but
         // existing tables don't — add it. Same shape for any v0.2 additive cols.
         add_column_if_missing(conn, "memories_meta", "updated_at", "TEXT")?;
+    }
+
+    if existing < 3 {
+        // v0.5 stores predate `feedback_count`, `confidence_at_create`,
+        // `last_decay_sweep_at`. All additive, all nullable or defaulted.
+        add_column_if_missing(
+            conn,
+            "memories_meta",
+            "feedback_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(conn, "memories_meta", "confidence_at_create", "REAL")?;
+        add_column_if_missing(conn, "memories_meta", "last_decay_sweep_at", "TEXT")?;
+        // Backfill confidence_at_create from the current confidence so the
+        // drift query has a baseline for pre-existing rows. Pre-existing
+        // memories report drift=0 until they're touched by feedback.
+        conn.execute(
+            "UPDATE memories_meta
+             SET confidence_at_create = confidence
+             WHERE confidence_at_create IS NULL",
+            [],
+        )?;
     }
 
     conn.execute(
