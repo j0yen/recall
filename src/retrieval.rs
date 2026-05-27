@@ -156,3 +156,47 @@ fn score(hit: Hit, vector_sim: f64, w: Weights, project_subject: Option<&str>) -
         vector_sim,
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
+mod tests {
+    use super::*;
+    use crate::index::Index;
+    use crate::memory::{Kind, Memory, Subject};
+
+    /// PRD-recall-outcome-feedback AC6: two otherwise-identical memories at
+    /// confidence 0.9 and 0.5 rank the 0.9 higher by exactly
+    /// `w.confidence * 0.4` in score. Same body so bm25 ties; no recall
+    /// touches so recency/recall_count contributions are zero for both.
+    #[test]
+    fn ac6_confidence_drives_ranking_delta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = Index::open(&tmp.path().join("idx.sqlite")).unwrap();
+
+        let body = "shared body about deployment runbook for the payments cluster";
+        let mut m_high = Memory::new(Kind::Semantic, Subject::user(), body);
+        m_high.front.confidence = 0.9;
+        let mut m_low = Memory::new(Kind::Semantic, Subject::user(), body);
+        m_low.front.confidence = 0.5;
+
+        idx.upsert(&m_high, &tmp.path().join("h.md"), None).unwrap();
+        idx.upsert(&m_low, &tmp.path().join("l.md"), None).unwrap();
+
+        let weights = Weights::default();
+        let ranked = search_with(&idx, "deployment runbook payments", 5, weights, None).unwrap();
+
+        assert_eq!(ranked.len(), 2, "both memories should match the shared body");
+        assert_eq!(
+            ranked[0].hit.id, m_high.front.id,
+            "0.9-confidence memory should rank first"
+        );
+        assert_eq!(ranked[1].hit.id, m_low.front.id);
+
+        let delta = ranked[0].score - ranked[1].score;
+        let expected = weights.confidence * 0.4;
+        assert!(
+            (delta - expected).abs() < 1e-9,
+            "score delta should equal w.confidence * 0.4 (= {expected}); got {delta}"
+        );
+    }
+}
