@@ -860,6 +860,45 @@ mod tests {
     }
 
     #[test]
+    fn confidence_drift_threshold_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = Index::open(&tmp.path().join("idx.sqlite")).unwrap();
+
+        // Memory A: drifted +0.35 from creation (above 0.3 threshold).
+        let m_drifted = Memory::new(Kind::Semantic, Subject::user(), "drifted");
+        idx.upsert(&m_drifted, &tmp.path().join("a.md"), None).unwrap();
+        idx.conn
+            .execute(
+                "UPDATE memories_meta SET confidence = ?1 WHERE id = ?2",
+                params![0.85_f64, m_drifted.front.id],
+            )
+            .unwrap();
+
+        // Memory B: drifted -0.1 from creation (below threshold).
+        let m_small = Memory::new(Kind::Semantic, Subject::user(), "small move");
+        idx.upsert(&m_small, &tmp.path().join("b.md"), None).unwrap();
+        idx.conn
+            .execute(
+                "UPDATE memories_meta SET confidence = ?1 WHERE id = ?2",
+                params![0.4_f64, m_small.front.id],
+            )
+            .unwrap();
+
+        // Memory C: stayed at 0.5 (no drift).
+        let m_still = Memory::new(Kind::Semantic, Subject::user(), "stays");
+        idx.upsert(&m_still, &tmp.path().join("c.md"), None).unwrap();
+
+        let hits = idx.confidence_drift(0.3).unwrap();
+        assert_eq!(hits.len(), 1, "only the drifted memory exceeds 0.3");
+        assert_eq!(hits[0].0, m_drifted.front.id);
+        assert!((hits[0].1 - 0.35).abs() < 1e-9, "drift={}", hits[0].1);
+
+        // Higher threshold filters everything out.
+        let empty = idx.confidence_drift(0.5).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn vector_search_returns_nearest_first() {
         use crate::embeddings::{Embedder, HashEmbedder};
         let tmp = tempfile::tempdir().unwrap();

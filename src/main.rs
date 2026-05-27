@@ -1827,6 +1827,12 @@ fn cmd_doctor(
         _ => (false, None),
     };
 
+    let drift = idx.confidence_drift(0.3)?;
+    let drift_json: Vec<serde_json::Value> = drift
+        .iter()
+        .map(|(id, d)| serde_json::json!({ "id": id, "drift": d }))
+        .collect();
+
     if format == "json" {
         let obj = serde_json::json!({
             "files_on_disk": on_disk.len(),
@@ -1847,6 +1853,7 @@ fn cmd_doctor(
             "total_recall_count": total_recall,
             "daemon_active": daemon_active,
             "daemon_uptime_s": daemon_uptime_s,
+            "confidence_drift": drift_json,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
@@ -1879,6 +1886,7 @@ fn cmd_doctor(
             println!("newest        : {n}");
         }
         println!("total recalls : {total_recall}");
+        println!("drift >=0.3   : {}  (confidence moved from creation)", drift.len());
         if daemon_active {
             match daemon_uptime_s {
                 Some(s) => println!("daemon        : active (uptime {s}s)"),
