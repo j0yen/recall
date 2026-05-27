@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.3 — 2026-05-27
+
+Braid proposals from Bash failures used to render as `Tool error: {}`
+because the Claude Code harness ships `tool_response: {}` for failing
+Bash calls — neither stderr nor the failing command surfaced. The
+proposal still fired (heuristic gates on `status:error` + corrective
+language), but lost the most informative half of the context.
+
+`recall observe` now falls back to `tool_input.command` (Bash),
+`tool_input.file_path` (Edit/Read/Write), or `tool_input.description`
+when `tool_response` is null/empty/`{}`. Truncated at 400 chars under
+an `Input:` line in the proposal body. Non-empty `tool_response`
+keeps the prior shape (no `Input:` line, avoids duplication).
+
+Pure observer-side change; no hooks touched, no schema bump. Three new
+unit tests cover empty-Bash, empty-Edit, and unknown-tool-input.
+
 ## v0.5.2 — 2026-05-26
 
 `recall daemon start`, `daemon stop`, and `daemon restart` ship as
