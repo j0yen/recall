@@ -844,6 +844,22 @@ mod tests {
     }
 
     #[test]
+    fn decay_sweep_is_idempotent_within_min_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = Index::open(&tmp.path().join("idx.sqlite")).unwrap();
+        let m1 = Memory::new(Kind::Semantic, Subject::user(), "a");
+        let m2 = Memory::new(Kind::Semantic, Subject::user(), "b");
+        idx.upsert(&m1, &tmp.path().join("a.md"), None).unwrap();
+        idx.upsert(&m2, &tmp.path().join("b.md"), None).unwrap();
+
+        let first = idx.apply_decay_sweep(90, 1).unwrap();
+        assert_eq!(first, 2, "first sweep stamps every row with last_decay_sweep_at");
+
+        let second = idx.apply_decay_sweep(90, 1).unwrap();
+        assert_eq!(second, 0, "same-day sweep is a no-op (PRD AC4)");
+    }
+
+    #[test]
     fn vector_search_returns_nearest_first() {
         use crate::embeddings::{Embedder, HashEmbedder};
         let tmp = tempfile::tempdir().unwrap();
