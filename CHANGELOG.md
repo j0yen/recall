@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.6.0 — 2026-05-27
+
+PRD-recall-outcome-feedback §6a (codename *weather*) lands the first half
+of outcome feedback for memory confidence.
+
+New subcommand `recall feedback` accepts `--accept <id>...` /
+`--reject <id>...` / `--abstain <id>` / `--decay-sweep`. Accept bumps
+confidence by `accept_delta` (default 0.02, ceiling 0.95). Reject
+decays by `reject_delta` (default 0.10, floor 0.05). Decay sweep moves
+confidence toward 0.5 along the formula
+`confidence' = 0.5 + (confidence - 0.5) * 2^(-days/half_life_d)`
+with a default 90-day half-life, idempotent within a day.
+
+Schema gains a `feedback_count` column on the memory index. New
+`[feedback]` config block exposes `accept_delta`, `reject_delta`,
+`floor`, `ceiling`, `half_life_d` knobs.
+
+ACs 1, 3, 5 pair against new `feedback.rs` unit tests (42/42 green).
+AC4 idempotency lives in `index::apply_decay_sweep`. ACs 2 (Stop-hook
+auto-accept), 6 (ranking diff smoke), 7 (doctor `confidence_drift`)
+phase to v0.6.1 / v0.6.2.
+
+Pure rust-extend; no hooks rewired this version.
+
 ## v0.5.3 — 2026-05-27
 
 Braid proposals from Bash failures used to render as `Tool error: {}`
