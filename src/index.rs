@@ -263,6 +263,124 @@ impl Index {
         Ok(updated)
     }
 
+    /// Temporal-decay report (PRD-recall-temporal-decay).
+    ///
+    /// Computes time-based confidence decay for every memory that:
+    /// - has not been swept within `min_interval_d` days (idempotency gate),
+    /// - produces a projected delta >= `min_delta` (skip negligible changes),
+    /// - matches `subject_prefix` if given.
+    ///
+    /// When `apply` is `true`, writes the new confidence to the store (same
+    /// SQL as `apply_decay_sweep`). When `false`, this is a dry run: the
+    /// returned `DecayCandidate` list shows projections with `applied=false`
+    /// and no state is mutated.
+    ///
+    /// Returns the list of candidates (whether applied or not).
+    pub fn temporal_decay_report(
+        &self,
+        half_life_d: u32,
+        min_interval_d: u32,
+        min_delta: f64,
+        subject_prefix: Option<&str>,
+        apply: bool,
+    ) -> Result<Vec<crate::temporal_decay::DecayCandidate>> {
+        use crate::temporal_decay::{DecayCandidate, is_worth_updating, project_decay};
+
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let min_interval_secs = i64::from(min_interval_d) * 86400;
+
+        let sql = "SELECT id, kind, subject, confidence, last_decay_sweep_at, created_at
+                   FROM memories_meta
+                   ORDER BY created_at DESC";
+        let mut stmt = self.conn.prepare(sql)?;
+
+        struct Row {
+            id: String,
+            kind: String,
+            subject: String,
+            confidence: f64,
+            last_sweep: Option<String>,
+            created_at: String,
+        }
+
+        let rows: Vec<Row> = stmt
+            .query_map([], |r| {
+                Ok(Row {
+                    id: r.get(0)?,
+                    kind: r.get(1)?,
+                    subject: r.get(2)?,
+                    confidence: r.get(3)?,
+                    last_sweep: r.get(4)?,
+                    created_at: r.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+
+        let mut candidates = Vec::new();
+
+        for row in rows {
+            // Subject prefix filter.
+            if let Some(prefix) = subject_prefix {
+                if !row.subject.starts_with(prefix) {
+                    continue;
+                }
+            }
+
+            // Idempotency gate: skip if last sweep is within min_interval_d.
+            if let Some(ref last) = row.last_sweep {
+                if let Ok(t) = DateTime::parse_from_rfc3339(last) {
+                    let elapsed = now
+                        .signed_duration_since(t.with_timezone(&Utc))
+                        .num_seconds();
+                    if elapsed < min_interval_secs {
+                        continue;
+                    }
+                }
+            }
+
+            // Days since last sweep (or creation if never swept).
+            let baseline_str = row.last_sweep.as_deref().unwrap_or(row.created_at.as_str());
+            let baseline = DateTime::parse_from_rfc3339(baseline_str)
+                .ok()
+                .map(|t| t.with_timezone(&Utc))
+                .unwrap_or(now);
+            let days =
+                (now.signed_duration_since(baseline).num_seconds() as f64) / 86400.0;
+
+            let new_conf = project_decay(row.confidence, days, half_life_d);
+
+            // Skip negligible changes.
+            if !is_worth_updating(row.confidence, new_conf, min_delta) {
+                continue;
+            }
+
+            if apply {
+                self.conn.execute(
+                    "UPDATE memories_meta
+                     SET confidence = ?1,
+                         last_decay_sweep_at = ?2
+                     WHERE id = ?3",
+                    params![new_conf, now_str, row.id],
+                )?;
+            }
+
+            candidates.push(DecayCandidate {
+                id: row.id,
+                kind: row.kind,
+                subject: row.subject,
+                confidence_before: row.confidence,
+                confidence_after: new_conf,
+                days_since_baseline: days,
+                half_life_d,
+                applied: apply,
+            });
+        }
+
+        Ok(candidates)
+    }
+
     /// Look up `feedback_count` for a single id (used by tests + observability).
     pub fn get_feedback_count(&self, id: &str) -> Result<u32> {
         let n: i64 = self

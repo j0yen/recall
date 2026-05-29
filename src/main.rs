@@ -7,6 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use clap::{Parser, Subcommand};
 use recall::config::Config;
 use recall::daemon;
+use recall::doctor_claims::{check_claims, CheckClaimsOpts};
 use recall::embeddings::EmbedderKind;
 use recall::index::{Index, MetaRow};
 use recall::memory::{Evidence, Kind, Memory, Subject};
@@ -14,8 +15,10 @@ use recall::observer;
 use recall::paths;
 use recall::retrieval::{self, Weights};
 use recall::scratch;
+use recall::session::{SessionFilter, parse_filter_arg};
 use recall::store::FileStore;
-use std::collections::HashSet;
+use recall::use_detect::{self, SurfacedMemory};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, BufRead, Read};
 use std::path::PathBuf;
 
@@ -107,6 +110,13 @@ enum Command {
         /// Caller-side token budget on returned bodies (0 = unlimited).
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// Filter by session id (PRD-recall-session-stamp §2.3).
+        /// Accepts a full id, a prefix (≥8 hex chars), `current`, or `latest`.
+        #[arg(long)]
+        session: Option<String>,
+        /// Include only memories with NO session stamp (unstamped).
+        #[arg(long, default_value_t = false)]
+        no_session: bool,
     },
 
     /// List memories (newest first). Optionally filter by subject prefix.
@@ -127,6 +137,23 @@ enum Command {
         include_decayed: bool,
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// Filter by session id (PRD-recall-session-stamp §2.3).
+        /// Accepts a full id, a prefix (≥8 hex chars), `current`, or `latest`.
+        #[arg(long)]
+        session: Option<String>,
+        /// Include only memories with NO session stamp (unstamped).
+        #[arg(long, default_value_t = false)]
+        no_session: bool,
+    },
+
+    /// List distinct session ids that wrote memories, with counts.
+    /// PRD-recall-session-stamp §2.4.
+    Sessions {
+        /// Only count memories written within this duration (e.g. `1d`, `7d`).
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value = "text")]
+        format: String,
     },
 
     /// Show a single memory's Markdown content by id.
@@ -191,12 +218,30 @@ enum Command {
     Where,
 
     /// Audit the store: disk vs index drift, supersedes integrity, embedder mix.
+    /// With `--check-claims`, also verifies filesystem-path and binary-version
+    /// assertions in memory bodies and parks drift proposals for review.
     Doctor {
         /// Run `reindex` for index/disk drift before reporting.
         #[arg(long, default_value_t = false)]
         fix: bool,
         #[arg(long, default_value = "text")]
         format: String,
+        /// Spot-check memory body claims against live filesystem and binaries.
+        #[arg(long, default_value_t = false)]
+        check_claims: bool,
+        /// With `--check-claims`: only scan memories whose subject starts with this.
+        #[arg(long)]
+        subject: Option<String>,
+        /// With `--check-claims`: only scan memories written/updated within this
+        /// duration (e.g. `30d`, `6mo`). Uses the same suffix syntax as `recall gc`.
+        #[arg(long)]
+        since: Option<String>,
+        /// With `--check-claims`: report but do not write proposals to `proposals/`.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// With `--check-claims`: skip binary `--version` fork-execs.
+        #[arg(long, default_value_t = false)]
+        no_binary_checks: bool,
     },
 
     /// List candidate memories for pruning. Never deletes unless `--apply` is set.
@@ -326,6 +371,56 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+
+    /// Detect which surfaced memories were actually used in a session.
+    /// Scans the Claude Code session JSONL for n-gram and API-recall evidence.
+    /// Writes `used.json` to the weather dir for the session.
+    /// See PRD-recall-use-evidence.
+    UseDetect {
+        /// Session id (Claude Code UUID). Required.
+        #[arg(long)]
+        session: String,
+        /// Override the transcript directory (default: `~/.claude/projects/-home-jsy/`).
+        #[arg(long)]
+        transcript_dir: Option<PathBuf>,
+        /// Output format: `text` or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// N-gram length for body matching (default: 5).
+        #[arg(long, default_value_t = 5)]
+        ngram_len: usize,
+    },
+
+    /// Time-based confidence decay sweep with dry-run and per-memory reporting.
+    ///
+    /// Applies the half-life formula `conf' = 0.5 + (conf-0.5) * 2^(-days/H)`.
+    /// Default is dry-run (no writes). Pass `--apply` to commit.
+    /// See PRD-recall-temporal-decay.
+    #[command(name = "temporal-decay")]
+    TemporalDecay {
+        /// Show what would decay without writing (default mode).
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Apply the decay (mutually exclusive intent with dry-run; --apply
+        /// sets dry_run to false).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Half-life in days (default: from recall.toml `feedback.half_life_d`, currently 90).
+        #[arg(long)]
+        half_life_d: Option<u32>,
+        /// Skip rows swept within N days (idempotency gate, default: 1).
+        #[arg(long, default_value_t = 1)]
+        min_interval_d: u32,
+        /// Skip memories whose projected |delta| is below this (default: 0.001).
+        #[arg(long, default_value_t = 0.001)]
+        min_delta: f64,
+        /// Only consider memories whose subject starts with this prefix.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Output format: `text` or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -426,6 +521,43 @@ enum ScratchOp {
     },
 }
 
+/// Parse `--session <arg>` and resolve `latest` by walking the store.
+///
+/// Returns `None` if `arg` is `None`. For `latest`, walks every memory to
+/// find the session id that most recently wrote any memory (most memories
+/// written, then lexicographic tiebreak) — mirrors `cmd_sessions` ordering.
+fn resolve_session_filter(
+    arg: Option<&str>,
+    root: &std::path::Path,
+) -> Result<Option<SessionFilter>> {
+    let arg = match arg {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+    let f = parse_filter_arg(arg)?;
+    if matches!(f, SessionFilter::Latest(_)) {
+        // Walk store to find the most-written session id.
+        let store = FileStore::open(root.to_path_buf())?;
+        let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+        for item in store.iter_all() {
+            if let Ok((mem, _)) = item {
+                if let Some(sid) = mem.front.written_by_session {
+                    *counts.entry(sid).or_insert(0) += 1;
+                }
+            }
+        }
+        let best = counts
+            .into_iter()
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+        match best {
+            Some((id, _)) => Ok(Some(SessionFilter::Latest(id))),
+            None => Err(anyhow!("--session latest: no session-stamped memories found")),
+        }
+    } else {
+        Ok(Some(f))
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = match cli.root {
@@ -476,24 +608,31 @@ fn main() -> Result<()> {
             include_superseded,
             include_decayed,
             max_tokens,
-        } => cmd_query(
-            &root,
-            &config,
-            &query,
-            limit,
-            &format,
-            touch,
-            hybrid,
-            subject.as_deref(),
-            kind.as_deref(),
-            since.as_deref(),
-            min_confidence,
-            include_superseded,
-            include_decayed,
-            max_tokens.unwrap_or(config.retrieval.max_tokens),
-            project_subject.as_deref(),
-            embedder_kind,
-        ),
+            session,
+            no_session,
+        } => {
+            let session_filter = resolve_session_filter(session.as_deref(), &root)?;
+            cmd_query(
+                &root,
+                &config,
+                &query,
+                limit,
+                &format,
+                touch,
+                hybrid,
+                subject.as_deref(),
+                kind.as_deref(),
+                since.as_deref(),
+                min_confidence,
+                include_superseded,
+                include_decayed,
+                max_tokens.unwrap_or(config.retrieval.max_tokens),
+                project_subject.as_deref(),
+                embedder_kind,
+                session_filter.as_ref(),
+                no_session,
+            )
+        }
         Command::List {
             subject,
             kind,
@@ -503,17 +642,25 @@ fn main() -> Result<()> {
             include_superseded,
             include_decayed,
             max_tokens,
-        } => cmd_list(
-            &root,
-            subject.as_deref(),
-            kind.as_deref(),
-            since.as_deref(),
-            &format,
-            limit,
-            include_superseded,
-            include_decayed,
-            max_tokens.unwrap_or(config.retrieval.max_tokens),
-        ),
+            session,
+            no_session,
+        } => {
+            let session_filter = resolve_session_filter(session.as_deref(), &root)?;
+            cmd_list(
+                &root,
+                subject.as_deref(),
+                kind.as_deref(),
+                since.as_deref(),
+                &format,
+                limit,
+                include_superseded,
+                include_decayed,
+                max_tokens.unwrap_or(config.retrieval.max_tokens),
+                session_filter.as_ref(),
+                no_session,
+            )
+        }
+        Command::Sessions { since, format } => cmd_sessions(&root, since.as_deref(), &format),
         Command::Show { id, format } => cmd_show(&root, &id, &format),
         Command::Delete { id } => cmd_delete(&root, &id),
         Command::Reindex => cmd_reindex(&root, embedder_kind),
@@ -541,7 +688,25 @@ fn main() -> Result<()> {
             embedder_kind,
         ),
         Command::Lineage { id, format } => cmd_lineage(&root, &id, &format),
-        Command::Doctor { fix, format } => cmd_doctor(&root, fix, &format, embedder_kind),
+        Command::Doctor {
+            fix,
+            format,
+            check_claims: do_check_claims,
+            subject,
+            since,
+            dry_run,
+            no_binary_checks,
+        } => cmd_doctor(
+            &root,
+            fix,
+            &format,
+            embedder_kind,
+            do_check_claims,
+            subject.as_deref(),
+            since.as_deref(),
+            dry_run,
+            no_binary_checks,
+        ),
         Command::Gc {
             older_than,
             never_recalled,
@@ -614,6 +779,31 @@ fn main() -> Result<()> {
             surfaced,
             decay_sweep,
             min_interval_d,
+            &format,
+            embedder_kind,
+        ),
+        Command::UseDetect {
+            session,
+            transcript_dir,
+            format,
+            ngram_len,
+        } => cmd_use_detect(&root, &session, transcript_dir.as_deref(), &format, ngram_len),
+        Command::TemporalDecay {
+            dry_run,
+            apply,
+            half_life_d,
+            min_interval_d,
+            min_delta,
+            subject,
+            format,
+        } => cmd_temporal_decay(
+            &root,
+            dry_run,
+            apply,
+            half_life_d,
+            min_interval_d,
+            min_delta,
+            subject.as_deref(),
             &format,
             embedder_kind,
         ),
@@ -1360,6 +1550,8 @@ fn cmd_query(
     max_tokens: usize,
     project_subject: Option<&str>,
     embedder_kind: EmbedderKind,
+    session_filter: Option<&SessionFilter>,
+    only_no_session: bool,
 ) -> Result<()> {
     // Auto-forward to the daemon when the call is filter-free: the v0.5.0
     // `query` op has no filter surface yet, so any subject/kind/since/
@@ -1373,7 +1565,9 @@ fn cmd_query(
         && min_confidence.is_none()
         && include_superseded
         && include_decayed
-        && !touch;
+        && !touch
+        && session_filter.is_none()
+        && !only_no_session;
     if can_forward {
         if let Ok(sock) = daemon::default_socket_path() {
             if sock.exists() {
@@ -1392,7 +1586,9 @@ fn cmd_query(
         || since.is_some()
         || min_confidence.is_some()
         || !include_superseded
-        || !include_decayed;
+        || !include_decayed
+        || session_filter.is_some()
+        || only_no_session;
     let inner_limit = if need_overfetch {
         limit.saturating_mul(4).max(20)
     } else {
@@ -1404,7 +1600,8 @@ fn cmd_query(
     } else {
         retrieval::search_with(&idx, query, inner_limit, weights, project_subject)?
     };
-    let store = if since.is_some() {
+    let need_store = since.is_some() || session_filter.is_some() || only_no_session;
+    let store = if need_store {
         Some(FileStore::open(root.to_path_buf())?)
     } else {
         None
@@ -1445,10 +1642,21 @@ fn cmd_query(
                 return false;
             }
         }
-        if let (Some(c), Some(st)) = (cutoff, &store) {
+        if let Some(st) = &store {
             if let Ok((mem, _)) = st.find_by_id(&r.hit.id) {
-                if mem.front.created_at < c {
+                if let Some(c) = cutoff {
+                    if mem.front.created_at < c {
+                        return false;
+                    }
+                }
+                let ws = mem.front.written_by_session.as_deref();
+                if only_no_session && ws.is_some() {
                     return false;
+                }
+                if let Some(sf) = session_filter {
+                    if !sf.matches(ws) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1527,19 +1735,24 @@ fn cmd_list(
     include_superseded: bool,
     include_decayed: bool,
     max_tokens: usize,
+    session_filter: Option<&SessionFilter>,
+    only_no_session: bool,
 ) -> Result<()> {
     let idx = Index::open(&paths::index_db(root))?;
     let need_overfetch = kind.is_some()
         || since.is_some()
         || !include_superseded
-        || !include_decayed;
+        || !include_decayed
+        || session_filter.is_some()
+        || only_no_session;
     let inner_limit = if need_overfetch {
         limit.saturating_mul(4).max(40)
     } else {
         limit
     };
     let mut hits = idx.list(subject, inner_limit)?;
-    let store = if since.is_some() {
+    let need_store = since.is_some() || session_filter.is_some() || only_no_session;
+    let store = if need_store {
         Some(FileStore::open(root.to_path_buf())?)
     } else {
         None
@@ -1570,10 +1783,21 @@ fn cmd_list(
                 return false;
             }
         }
-        if let (Some(c), Some(st)) = (cutoff, &store) {
+        if let Some(st) = &store {
             if let Ok((mem, _)) = st.find_by_id(&h.id) {
-                if mem.front.created_at < c {
+                if let Some(c) = cutoff {
+                    if mem.front.created_at < c {
+                        return false;
+                    }
+                }
+                let ws = mem.front.written_by_session.as_deref();
+                if only_no_session && ws.is_some() {
                     return false;
+                }
+                if let Some(sf) = session_filter {
+                    if !sf.matches(ws) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1698,11 +1922,23 @@ fn cmd_touch(root: &std::path::Path, ids: Vec<String>, format: &str) -> Result<(
     if ids.is_empty() {
         return Err(anyhow!("touch requires at least one id"));
     }
+    let store = FileStore::open(root.to_path_buf())?;
     let idx = Index::open(&paths::index_db(root))?;
+    // Resolve the session id once for all touches in this invocation.
+    // PRD-recall-session-stamp §2.5: stamp `last_touched_by_session` on touch.
+    let touch_session = recall::session::resolve().id;
     let mut results: Vec<(String, Option<u32>, Option<String>)> = Vec::new();
     for id in ids {
         match idx.touch_recall(&id) {
-            Ok(n) => results.push((id, Some(n), None)),
+            Ok(n) => {
+                // Best-effort: update last_touched_by_session on disk.
+                // Failure here is non-fatal — the index touch already succeeded.
+                if let Ok((mut mem, path)) = store.find_by_id(&id) {
+                    mem.front.last_touched_by_session = Some(touch_session.clone());
+                    let _ = store.overwrite(&path, &mem);
+                }
+                results.push((id, Some(n), None));
+            }
             Err(e) => results.push((id, None, Some(format!("{e:#}")))),
         }
     }
@@ -1853,11 +2089,17 @@ fn cmd_lineage(root: &std::path::Path, id: &str, format: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_doctor(
     root: &std::path::Path,
     fix: bool,
     format: &str,
     embedder_kind: EmbedderKind,
+    do_check_claims: bool,
+    subject: Option<&str>,
+    since: Option<&str>,
+    dry_run: bool,
+    no_binary_checks: bool,
 ) -> Result<()> {
     if fix {
         cmd_reindex(root, embedder_kind)?;
@@ -1990,6 +2232,34 @@ fn cmd_doctor(
                 "hint: {} memories have a different embedder id; run `recall reindex` to rebuild.",
                 embedder_mismatch.iter().map(|_| ()).count()
             );
+        }
+    }
+
+    // ── check-claims mode ────────────────────────────────────────────────────
+    if do_check_claims {
+        let since_dur = match since {
+            Some(s) => Some(parse_since_long(s)?),
+            None => None,
+        };
+        let opts = CheckClaimsOpts {
+            subject_filter: subject.map(str::to_string),
+            since: since_dur,
+            dry_run,
+            no_binary_checks,
+        };
+        // Load all memories for the scan. We use store.iter_all() which reads
+        // full frontmatter + body — needed for body analysis.
+        let memories: Vec<(Memory, PathBuf)> = store
+            .iter_all()
+            .filter_map(|r| r.ok())
+            .collect();
+        let results = check_claims(root, &opts, &memories)?;
+        recall::doctor_claims::print_summary(&results, dry_run, format)?;
+
+        // Exit code 1 if any disconfirmed assertions were found (AC6).
+        let total_disconfirmed: usize = results.iter().map(|r| r.disconfirmed.len()).sum();
+        if total_disconfirmed > 0 {
+            std::process::exit(1);
         }
     }
     Ok(())
@@ -2566,6 +2836,58 @@ fn cmd_session_diff(
     Ok(())
 }
 
+/// `recall sessions [--since <dur>]` — PRD-recall-session-stamp §2.4.
+///
+/// Lists distinct `written_by_session` values found across all memory files,
+/// with the count of memories each session wrote. Sessions are sorted by
+/// descending count (most prolific first). The `latest` id in
+/// `recall query --session latest` resolves to the top entry here.
+fn cmd_sessions(root: &std::path::Path, since: Option<&str>, format: &str) -> Result<()> {
+    let cutoff: Option<DateTime<Utc>> = match since {
+        Some(s) => Some(Utc::now() - parse_since(s)?),
+        None => None,
+    };
+    let store = FileStore::open(root.to_path_buf())?;
+    // BTreeMap for deterministic ordering before we sort by count.
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for item in store.iter_all() {
+        let (mem, _) = match item {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("skip: {e:#}");
+                continue;
+            }
+        };
+        // Apply time filter if requested.
+        if let Some(c) = cutoff {
+            if mem.front.created_at < c {
+                continue;
+            }
+        }
+        if let Some(sid) = mem.front.written_by_session {
+            *counts.entry(sid).or_insert(0) += 1;
+        }
+    }
+    // Sort by count descending, then id lexicographically.
+    let mut rows: Vec<(String, u64)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    if format == "json" {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(id, n)| serde_json::json!({ "session_id": id, "memory_count": n }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    } else {
+        if rows.is_empty() {
+            println!("(no session-stamped memories found)");
+        }
+        for (id, n) in &rows {
+            println!("{id}  count={n}");
+        }
+    }
+    Ok(())
+}
+
 /// Extended duration parser used by `gc --older-than`: accepts the `m/h/d`
 /// suffixes of `parse_since` plus `w`, `mo`, `y`.
 fn parse_since_long(s: &str) -> Result<Duration> {
@@ -2591,4 +2913,219 @@ fn parse_since_long(s: &str) -> Result<Duration> {
         "y" => Ok(Duration::days(n.saturating_mul(365))),
         _ => Err(anyhow!("unknown duration suffix in: {s} (use m|h|d|w|mo|y)")),
     }
+}
+
+/// `recall use-detect --session <sid>` — scan the Claude Code session JSONL
+/// and detect which surfaced memories were actually used.
+///
+/// Writes `used.json` to `$RECALL_WEATHER_DIR/<sid>/used.json`.
+/// Exits 0 even if no evidence is found (empty `[]` is a valid result).
+/// Exits 0 with a stderr note if the transcript file does not exist (AC6).
+fn cmd_use_detect(
+    root: &std::path::Path,
+    session_id: &str,
+    transcript_dir: Option<&std::path::Path>,
+    format: &str,
+    ngram_len: usize,
+) -> Result<()> {
+    // 1. Locate the transcript file.
+    let transcript_path = match transcript_dir {
+        Some(dir) => dir.join(format!("{session_id}.jsonl")),
+        None => {
+            // Default: ~/.claude/projects/-home-jsy/<sid>.jsonl
+            let home = directories::BaseDirs::new()
+                .context("could not resolve user home directory")?;
+            home.home_dir()
+                .join(".claude")
+                .join("projects")
+                .join("-home-jsy")
+                .join(format!("{session_id}.jsonl"))
+        }
+    };
+
+    if !transcript_path.exists() {
+        eprintln!(
+            "[recall use-detect] transcript not found: {} — no use evidence written",
+            transcript_path.display()
+        );
+        return Ok(());
+    }
+
+    // 2. Locate the weather dir and load surfaced ids.
+    let weather_dir = use_detect::weather_dir_for_session(session_id)?;
+    let surfaced_ids = use_detect::load_surfaced_ids(&weather_dir)?;
+
+    if surfaced_ids.is_empty() {
+        // Nothing surfaced → write empty used.json and exit.
+        use_detect::write_used_json(&weather_dir, &[])?;
+        if format == "json" {
+            let out = serde_json::json!({
+                "session_id": session_id,
+                "surfaced": 0,
+                "used": 0,
+                "ngram_hits": 0,
+                "id_hits": 0,
+                "transcript_bytes": transcript_path.metadata().map(|m| m.len()).unwrap_or(0),
+                "scan_ms": 0,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!("session_id: {session_id}");
+            println!("surfaced: 0  used: 0  (no surfaced ids — skipped scan)");
+        }
+        return Ok(());
+    }
+
+    // 3. Load memory bodies from the store.
+    let store = FileStore::open(root.to_path_buf())
+        .with_context(|| format!("open recall store at {}", root.display()))?;
+    let mut surfaced_memories: Vec<SurfacedMemory> = Vec::with_capacity(surfaced_ids.len());
+    for id in &surfaced_ids {
+        match store.find_by_id(id) {
+            Ok((mem, _path)) => {
+                surfaced_memories.push(SurfacedMemory {
+                    id: id.clone(),
+                    body: mem.body.clone(),
+                });
+            }
+            Err(_) => {
+                // Memory may have been deleted; skip it (conservative, empty body matches nothing).
+                surfaced_memories.push(SurfacedMemory {
+                    id: id.clone(),
+                    body: String::new(),
+                });
+            }
+        }
+    }
+
+    // 4. Scan the transcript.
+    let result = use_detect::scan_transcript(
+        &transcript_path,
+        &surfaced_memories,
+        session_id,
+        ngram_len,
+    )?;
+
+    // 5. Write used.json.
+    use_detect::write_used_json(&weather_dir, &result.used_ids)?;
+
+    // 6. Print summary.
+    if format == "json" {
+        let out = serde_json::json!({
+            "session_id": result.session_id,
+            "surfaced": result.surfaced,
+            "used": result.used,
+            "ngram_hits": result.ngram_hits,
+            "id_hits": result.id_hits,
+            "transcript_bytes": result.transcript_bytes,
+            "scan_ms": result.scan_ms,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "session_id: {}  surfaced: {}  used: {}  ngram_hits: {}  id_hits: {}  \
+             transcript_bytes: {}  scan_ms: {}",
+            result.session_id,
+            result.surfaced,
+            result.used,
+            result.ngram_hits,
+            result.id_hits,
+            result.transcript_bytes,
+            result.scan_ms,
+        );
+    }
+
+    Ok(())
+}
+
+/// `recall temporal-decay` — time-based confidence decay with dry-run reporting.
+///
+/// See PRD-recall-temporal-decay.
+#[allow(clippy::too_many_arguments)]
+fn cmd_temporal_decay(
+    root: &std::path::Path,
+    dry_run: bool,
+    apply: bool,
+    half_life_d_override: Option<u32>,
+    min_interval_d: u32,
+    min_delta: f64,
+    subject_prefix: Option<&str>,
+    format: &str,
+    _embedder_kind: EmbedderKind,
+) -> Result<()> {
+    // --apply overrides the default dry_run=true. Both false → dry run.
+    let do_apply = apply && !dry_run || apply;
+    let is_dry_run = !do_apply;
+
+    let config = Config::load(root)?;
+    let half_life_d = half_life_d_override.unwrap_or(config.feedback.half_life_d);
+
+    let idx = Index::open(&paths::index_db(root))?;
+    let candidates = idx.temporal_decay_report(
+        half_life_d,
+        min_interval_d,
+        min_delta,
+        subject_prefix,
+        do_apply,
+    )?;
+
+    let applied_count = if do_apply { candidates.len() } else { 0 };
+
+    if format == "json" {
+        let mems: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "kind": c.kind,
+                    "subject": c.subject,
+                    "confidence_before": c.confidence_before,
+                    "confidence_after": c.confidence_after,
+                    "delta": c.delta(),
+                    "days_since_baseline": c.days_since_baseline,
+                    "applied": c.applied,
+                })
+            })
+            .collect();
+        let obj = serde_json::json!({
+            "half_life_d": half_life_d,
+            "min_interval_d": min_interval_d,
+            "min_delta": min_delta,
+            "dry_run": is_dry_run,
+            "candidates": candidates.len(),
+            "applied": applied_count,
+            "memories": mems,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        println!(
+            "Temporal decay sweep (half-life={}d, dry-run={}):",
+            half_life_d, is_dry_run
+        );
+        for c in &candidates {
+            println!(
+                "  {}  {}/{}  conf {:.3} → {:.3}  ({:+.3}, {:.1} days)",
+                c.id,
+                c.kind,
+                c.subject,
+                c.confidence_before,
+                c.confidence_after,
+                c.delta(),
+                c.days_since_baseline,
+            );
+        }
+        if is_dry_run {
+            println!(
+                "{} memories would decay (0 applied).",
+                candidates.len()
+            );
+        } else {
+            println!(
+                "{} memories decayed.",
+                applied_count
+            );
+        }
+    }
+
+    Ok(())
 }

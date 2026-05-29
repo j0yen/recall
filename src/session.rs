@@ -10,10 +10,10 @@
 //! 5. Fallback string `comm:<argv0>:pid:<pid>:uid:<uid>` — same shape
 //!    provfs uses when the agent_session id is unavailable.
 //!
-//! Iter-1 of recall-session-stamp: this module only exposes the
-//! resolver. Wiring into `recall save` / query / sessions subcommand
-//! lands in subsequent iters.
+//! Also exposes `SessionFilter` for `recall query --session` /
+//! `recall list --session` filtering (PRD §2.3).
 
+use anyhow::{Result, anyhow};
 use std::env;
 use std::fs;
 
@@ -53,6 +53,79 @@ pub fn resolve() -> Resolved {
         return Resolved { id: v, source: Source::HookFile };
     }
     Resolved { id: fallback_id(), source: Source::Fallback }
+}
+
+/// A parsed `--session <arg>` filter value. Constructed via
+/// [`parse_filter_arg`]; used to test whether a memory's
+/// `written_by_session` matches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionFilter {
+    /// `--session current` — resolved at query time to the env-chain id.
+    Current(String),
+    /// `--session latest` — the caller must supply the latest known id.
+    Latest(String),
+    /// Full exact id match.
+    Exact(String),
+    /// Prefix match (caller validated ≥8 chars).
+    Prefix(String),
+}
+
+impl SessionFilter {
+    /// Returns `true` if `memory_session` matches this filter.
+    ///
+    /// `memory_session` is the `written_by_session` field of a memory
+    /// (`None` means the memory was written without a session stamp).
+    pub fn matches(&self, memory_session: Option<&str>) -> bool {
+        let Some(ms) = memory_session else { return false };
+        match self {
+            Self::Current(id) | Self::Latest(id) | Self::Exact(id) => ms == id,
+            Self::Prefix(pfx) => ms.starts_with(pfx.as_str()),
+        }
+    }
+}
+
+/// Parse `--session <arg>` into a [`SessionFilter`].
+///
+/// Accepts:
+/// - `current` — resolves to the precedence-chain id at call time.
+/// - `latest`  — must be resolved externally (caller passes resolved id).
+///   This variant is returned with an empty placeholder; callers using
+///   `latest` should call [`resolve_latest`] on the store instead.
+/// - A hex string of ≥8 chars — used as a prefix match if shorter than
+///   the full 32-hex id, or an exact match if the whole id.
+/// - A full hex id (with or without dashes).
+///
+/// Returns an error for hex-ish strings shorter than 8 chars.
+pub fn parse_filter_arg(arg: &str) -> Result<SessionFilter> {
+    match arg {
+        "current" => Ok(SessionFilter::Current(resolve().id)),
+        "latest" => {
+            // The "latest" variant is a sentinel; the actual id must be
+            // determined by the caller by walking the store. We return a
+            // distinguishable variant so the caller can branch.
+            Ok(SessionFilter::Latest(String::new()))
+        }
+        _ => {
+            // Strip dashes to get the raw hex portion for length check.
+            let no_dashes: String = arg.chars().filter(|c| *c != '-').collect();
+            if no_dashes.chars().all(|c| c.is_ascii_hexdigit()) && !no_dashes.is_empty() {
+                if no_dashes.len() < 8 {
+                    return Err(anyhow!(
+                        "--session prefix must be at least 8 hex chars (got {})",
+                        no_dashes.len()
+                    ));
+                }
+                if no_dashes.len() == 32 {
+                    Ok(SessionFilter::Exact(arg.to_string()))
+                } else {
+                    Ok(SessionFilter::Prefix(no_dashes))
+                }
+            } else {
+                // Non-hex (e.g. `comm:…` fallback ids): exact match only.
+                Ok(SessionFilter::Exact(arg.to_string()))
+            }
+        }
+    }
 }
 
 fn read_env(name: &str) -> Option<String> {

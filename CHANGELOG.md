@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.8.0 — 2026-05-29
+
+feat: add `recall doctor --check-claims` command
+
+New `doctor_claims` module spots-checks memory body assertions against live
+filesystem state and installed binary versions:
+
+- Kind A: filesystem-path assertions (fenced code blocks, `path:` prefixes)
+  — each asserted path is stat'd; missing paths become proposals
+- Kind B: binary-version assertions for a curated whitelist of binaries
+  — forks `<binary> --version`, extracts semver, compares; mismatches become proposals
+- Proposals written to `<root>/proposals/` as Markdown files for user review
+- `--dry-run` flag to report without writing proposal files
+- `--skip-version-checks` flag to skip binary fork-execs
+- `--subject-prefix` and `--since` filters to scope the scan
+- JSON and plain-text output formats supported
+
+## v0.7.0 — 2026-05-29
+
+`recall doctor --check-claims` spot-checks memory body assertions against live filesystem state
+and binary versions. Two Fleet-1 assertion kinds: (A) filesystem-path assertions (in fenced code
+blocks or prose with trigger phrases like "see ", "lives at ", etc.), (B) version-number claims
+for a 19-binary whitelist. Disconfirmed assertions produce proposal files under
+`~/.claude/recall/proposals/` (same review surface as `recall observe`) — no auto-edits.
+
+Also lands: temporal-decay report via `recall doctor --temporal-decay`; use-detect evidence
+tracking via `recall use-detect`; session-stamp query filters (`--session`, `--no-session`);
+`recall sessions` subcommand listing distinct session ids with memory counts.
+
+Exit codes: 0 clean scan, 1 at least one disconfirmed assertion, 2 scan error.
+
 ## v0.6.0 — 2026-05-27
 
 PRD-recall-outcome-feedback §6a (codename *weather*) lands the first half

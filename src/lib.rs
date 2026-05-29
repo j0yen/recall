@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod daemon;
+pub mod doctor_claims;
 pub mod embeddings;
 pub mod feedback;
 pub mod index;
@@ -22,3 +23,5 @@ pub mod retrieval;
 pub mod scratch;
 pub mod session;
 pub mod store;
+pub mod temporal_decay;
+pub mod use_detect;
