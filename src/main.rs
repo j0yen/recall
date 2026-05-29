@@ -71,6 +71,13 @@ enum Command {
         /// e.g. `30d`, `6mo`, `1y`, `never`.
         #[arg(long)]
         decays_after: Option<String>,
+        /// Intent of the writing session (e.g. `/build`). Stamped into
+        /// `written_by_intent`. Defaults to `$RECALL_SESSION_INTENT` if set.
+        #[arg(long)]
+        intent: Option<String>,
+        /// Skip all session-id stamping (PRD-recall-session-stamp §2.2).
+        #[arg(long, default_value_t = false)]
+        no_session_stamp: bool,
     },
 
     /// Search memories by keyword (and optionally vector). Prints ranked results.
@@ -440,6 +447,8 @@ fn main() -> Result<()> {
             supersedes,
             evidence,
             decays_after,
+            intent,
+            no_session_stamp,
         } => cmd_write(
             &root,
             &kind,
@@ -450,6 +459,8 @@ fn main() -> Result<()> {
             supersedes,
             evidence,
             decays_after,
+            intent,
+            no_session_stamp,
             embedder_kind,
         ),
         Command::Query {
@@ -1259,6 +1270,8 @@ fn cmd_write(
     supersedes: Vec<String>,
     evidence: Vec<String>,
     decays_after: Option<String>,
+    intent: Option<String>,
+    no_session_stamp: bool,
     embedder_kind: EmbedderKind,
 ) -> Result<()> {
     let body_text = read_body(body, file)?;
@@ -1278,6 +1291,21 @@ fn cmd_write(
         .map(|e| parse_evidence(&e))
         .collect::<Result<Vec<_>>>()?;
     mem.front.decays_after = decays_after;
+    // PRD-recall-session-stamp §2.1/§2.2: stamp origin session unless the
+    // caller opted out. `last_touched_by_session` mirrors the writer at
+    // creation time so the audit trail starts populated.
+    if !no_session_stamp {
+        let sid = recall::session::resolve().id;
+        mem.front.written_by_session = Some(sid.clone());
+        mem.front.last_touched_by_session = Some(sid);
+        let resolved_intent = intent.or_else(|| {
+            std::env::var("RECALL_SESSION_INTENT")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+        mem.front.written_by_intent = resolved_intent;
+    }
     let path = store.write(&mem)?;
     let embedder = embedder_kind.build()?;
     let vec = embedder.embed(&mem.body)?;

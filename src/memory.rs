@@ -109,6 +109,18 @@ pub struct Frontmatter {
     pub supersedes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decays_after: Option<String>,
+    /// Session id that originally wrote this memory (PRD-recall-session-stamp
+    /// §2.1). Optional & schema-additive: files written by recall < v0.7.0
+    /// parse back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by_session: Option<String>,
+    /// Intent of the writing session (e.g. `/build`). Optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by_intent: Option<String>,
+    /// Session id of the most recent `touch` / `update`. Updated on touch;
+    /// never fabricated for memories of unknown origin (PRD §2.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_touched_by_session: Option<String>,
 }
 
 fn default_confidence() -> f64 {
@@ -140,6 +152,9 @@ impl Memory {
                 surfaced_count: 0,
                 supersedes: Vec::new(),
                 decays_after: None,
+                written_by_session: None,
+                written_by_intent: None,
+                last_touched_by_session: None,
             },
             body: body.into(),
         }
@@ -247,5 +262,38 @@ mod tests {
         }
         let back = Memory::from_markdown(&stripped).unwrap();
         assert_eq!(back.front.surfaced_count, 0);
+    }
+
+    /// AC2/AC3 (PRD-recall-session-stamp) — the three session fields survive a
+    /// frontmatter round-trip, and a memory written without them parses back
+    /// as `None` (schema-additive, no migration needed).
+    #[test]
+    fn session_stamp_fields_roundtrip_and_default_none() {
+        // Default: no stamp → fields are None and omitted from the YAML.
+        let m = Memory::new(Kind::Reflective, Subject::self_(), "no stamp body");
+        assert!(m.front.written_by_session.is_none());
+        let md = m.to_markdown().unwrap();
+        assert!(
+            !md.contains("written_by_session"),
+            "unstamped memory must not emit the field; got:\n{md}"
+        );
+        let back = Memory::from_markdown(&md).unwrap();
+        assert!(back.front.written_by_session.is_none());
+        assert!(back.front.written_by_intent.is_none());
+        assert!(back.front.last_touched_by_session.is_none());
+
+        // Stamped: all three round-trip.
+        let mut s = Memory::new(Kind::Reflective, Subject::self_(), "stamped body");
+        s.front.written_by_session = Some("deadbeef0123".into());
+        s.front.written_by_intent = Some("/build".into());
+        s.front.last_touched_by_session = Some("deadbeef0123".into());
+        let md = s.to_markdown().unwrap();
+        let back = Memory::from_markdown(&md).unwrap();
+        assert_eq!(back.front.written_by_session.as_deref(), Some("deadbeef0123"));
+        assert_eq!(back.front.written_by_intent.as_deref(), Some("/build"));
+        assert_eq!(
+            back.front.last_touched_by_session.as_deref(),
+            Some("deadbeef0123")
+        );
     }
 }
