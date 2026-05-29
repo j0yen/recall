@@ -80,11 +80,18 @@ fn ac1_json_session_id_triggers_promote() {
     assert!(out.status.success(), "hook should exit 0, got {:?}", out);
 
     let lines = log_lines(dir.path());
-    assert_eq!(lines.len(), 1, "expected one promote call, got {lines:?}");
+    // Stop hook calls: (1) promote, (2) use-detect (PRD-recall-use-evidence AC8)
+    assert!(lines.len() >= 1, "expected at least one promote call, got {lines:?}");
     assert!(
-        lines[0].contains("promote --session abc-123 --format text"),
-        "argv was {:?}",
-        lines[0]
+        lines.iter().any(|l| l.contains("promote --session abc-123 --format text")),
+        "expected promote call; calls were {:?}",
+        lines
+    );
+    // use-detect call should also be present
+    assert!(
+        lines.iter().any(|l| l.contains("use-detect --session abc-123 --format text")),
+        "expected use-detect call; calls were {:?}",
+        lines
     );
 }
 
@@ -98,11 +105,17 @@ fn ac2_env_fallback_when_json_missing_session_id() {
     assert!(out.status.success(), "hook should exit 0, got {:?}", out);
 
     let lines = log_lines(dir.path());
-    assert_eq!(lines.len(), 1, "expected one promote call, got {lines:?}");
+    // Stop hook calls: (1) promote, (2) use-detect (PRD-recall-use-evidence AC8)
+    assert!(lines.len() >= 1, "expected at least one promote call, got {lines:?}");
     assert!(
-        lines[0].contains("promote --session env-sid-456 --format text"),
-        "argv was {:?}",
-        lines[0]
+        lines.iter().any(|l| l.contains("promote --session env-sid-456 --format text")),
+        "expected promote call; calls were {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("use-detect --session env-sid-456 --format text")),
+        "expected use-detect call; calls were {:?}",
+        lines
     );
 }
 
@@ -147,10 +160,21 @@ fn ac5_json_session_id_wins_over_env() {
     assert!(out.status.success(), "hook should exit 0, got {:?}", out);
 
     let lines = log_lines(dir.path());
-    assert_eq!(lines.len(), 1, "expected one promote call, got {lines:?}");
+    // Stop hook calls: (1) promote, (2) use-detect (PRD-recall-use-evidence AC8)
+    assert!(lines.len() >= 1, "expected at least one promote call, got {lines:?}");
     assert!(
-        lines[0].contains("promote --session json-wins --format text"),
-        "argv was {:?}",
-        lines[0]
+        lines.iter().any(|l| l.contains("promote --session json-wins --format text")),
+        "expected promote call with json-wins sid; calls were {:?}",
+        lines
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("use-detect --session json-wins --format text")),
+        "expected use-detect call with json-wins sid; calls were {:?}",
+        lines
+    );
+    // env sid must NOT appear in any call
+    assert!(
+        !lines.iter().any(|l| l.contains("env-loses")),
+        "env sid leaked into calls: {lines:?}"
     );
 }
