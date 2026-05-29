@@ -153,6 +153,10 @@ hooks (`post-tool-use`, `user-prompt-submit`, `stop`) which all
 ship here. SessionStart will move in when it lands as a recall
 subcommand (`recall session-start --emit`).
 
+## Recent
+
+- **v0.8.0+** (surfaced-tracking): Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination.
+
 ## Provenance
 
 Built via the [`autobuilder`](https://github.com/j0yen/autobuilder)
