@@ -303,6 +303,12 @@ enum Command {
         /// (still increments `feedback_count`, leaves confidence unchanged).
         #[arg(long, value_delimiter = ' ', num_args = 0..)]
         abstain: Vec<String>,
+        /// Memories that were surfaced (hook-injected into context).
+        /// Increments `surfaced_count` only; confidence and `feedback_count`
+        /// are unchanged. Distinct from `--accept`: surfacing is the
+        /// observation event, accept/reject is the outcome.
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        surfaced: Vec<String>,
         /// Run the decay sweep across every memory after applying ids.
         #[arg(long, default_value_t = false)]
         decay_sweep: bool,
@@ -584,6 +590,7 @@ fn main() -> Result<()> {
             accept,
             reject,
             abstain,
+            surfaced,
             decay_sweep,
             min_interval_d,
             format,
@@ -593,6 +600,7 @@ fn main() -> Result<()> {
             accept,
             reject,
             abstain,
+            surfaced,
             decay_sweep,
             min_interval_d,
             &format,
@@ -1078,14 +1086,20 @@ fn cmd_feedback(
     accept: Vec<String>,
     reject: Vec<String>,
     abstain: Vec<String>,
+    surfaced: Vec<String>,
     decay_sweep: bool,
     min_interval_d: u32,
     format: &str,
     _embedder_kind: EmbedderKind,
 ) -> Result<()> {
-    if accept.is_empty() && reject.is_empty() && abstain.is_empty() && !decay_sweep {
+    if accept.is_empty()
+        && reject.is_empty()
+        && abstain.is_empty()
+        && surfaced.is_empty()
+        && !decay_sweep
+    {
         return Err(anyhow!(
-            "feedback requires at least one of --accept, --reject, --abstain, or --decay-sweep"
+            "feedback requires at least one of --accept, --reject, --abstain, --surfaced, or --decay-sweep"
         ));
     }
     let store = FileStore::open(root.to_path_buf())?;
@@ -1098,6 +1112,7 @@ fn cmd_feedback(
         op: &'static str,
         new_confidence: Option<f64>,
         feedback_count: Option<u32>,
+        surfaced_count: Option<u32>,
         error: Option<String>,
     }
 
@@ -1119,6 +1134,7 @@ fn cmd_feedback(
                 op,
                 new_confidence: Some(conf),
                 feedback_count: Some(n),
+                surfaced_count: None,
                 error: None,
             }),
             Err(e) => results.push(Outcome {
@@ -1126,6 +1142,31 @@ fn cmd_feedback(
                 op,
                 new_confidence: None,
                 feedback_count: None,
+                surfaced_count: None,
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+
+    // surfaced increments are independent of confidence/feedback_count.
+    // Run after accept/reject/abstain so the markdown write order is
+    // stable: outcome updates first, then the surface marker.
+    for id in surfaced {
+        match apply_surfaced_one(&store, &idx, &id) {
+            Ok(n) => results.push(Outcome {
+                id,
+                op: "surfaced",
+                new_confidence: None,
+                feedback_count: None,
+                surfaced_count: Some(n),
+                error: None,
+            }),
+            Err(e) => results.push(Outcome {
+                id,
+                op: "surfaced",
+                new_confidence: None,
+                feedback_count: None,
+                surfaced_count: None,
                 error: Some(format!("{e:#}")),
             }),
         }
@@ -1146,6 +1187,7 @@ fn cmd_feedback(
                     "op": o.op,
                     "confidence": o.new_confidence,
                     "feedback_count": o.feedback_count,
+                    "surfaced_count": o.surfaced_count,
                     "error": o.error,
                 })
             })
@@ -1157,16 +1199,20 @@ fn cmd_feedback(
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
         for o in &results {
-            match (&o.new_confidence, &o.error) {
-                (Some(c), _) => println!(
+            match (&o.new_confidence, &o.surfaced_count, &o.error) {
+                (Some(c), _, _) => println!(
                     "{}  {}  conf={:.3}  feedback_count={}",
                     o.id,
                     o.op,
                     c,
                     o.feedback_count.unwrap_or(0)
                 ),
-                (None, Some(e)) => println!("{}  {}  ERROR: {}", o.id, o.op, e),
-                (None, None) => println!("{}  {}  (no change)", o.id, o.op),
+                (None, Some(n), _) => println!(
+                    "{}  {}  surfaced_count={}",
+                    o.id, o.op, n,
+                ),
+                (None, None, Some(e)) => println!("{}  {}  ERROR: {}", o.id, o.op, e),
+                (None, None, None) => println!("{}  {}  (no change)", o.id, o.op),
             }
         }
         if let Some(n) = sweep_count {
@@ -1191,6 +1237,16 @@ fn apply_feedback_one(
     mem.front.updated_at = Some(Utc::now());
     store.overwrite(&path, &mem)?;
     Ok((new_conf, new_count))
+}
+
+fn apply_surfaced_one(store: &FileStore, idx: &Index, id: &str) -> Result<u32> {
+    let new_count = idx.apply_surfaced_increment(id)?;
+    // Mirror to markdown — the file stays the source of truth.
+    let (mut mem, path) = store.find_by_id(id)?;
+    mem.front.surfaced_count = new_count;
+    mem.front.updated_at = Some(Utc::now());
+    store.overwrite(&path, &mem)?;
+    Ok(new_count)
 }
 
 fn cmd_write(

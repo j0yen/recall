@@ -103,6 +103,8 @@ pub struct Frontmatter {
     pub recall_count: u32,
     #[serde(default)]
     pub feedback_count: u32,
+    #[serde(default)]
+    pub surfaced_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +137,7 @@ impl Memory {
                 last_recalled_at: None,
                 recall_count: 0,
                 feedback_count: 0,
+                surfaced_count: 0,
                 supersedes: Vec::new(),
                 decays_after: None,
             },
@@ -202,5 +205,47 @@ mod tests {
         for k in [Kind::Episodic, Kind::Semantic, Kind::Procedural, Kind::Reflective] {
             assert_eq!(Kind::from_str(k.as_str()).unwrap(), k);
         }
+    }
+
+    /// AC3 (PRD-recall-surfaced-tracking) — `surfaced_count` survives a
+    /// frontmatter round-trip. Verifies the field serializes and the
+    /// `#[serde(default)]` reads back the explicit value (not the default).
+    #[test]
+    fn surfaced_count_roundtrip_markdown() {
+        let mut m = Memory::new(
+            Kind::Semantic,
+            Subject::user(),
+            "surface tracking smoke",
+        );
+        m.front.surfaced_count = 7;
+        let md = m.to_markdown().unwrap();
+        let back = Memory::from_markdown(&md).unwrap();
+        assert_eq!(back.front.surfaced_count, 7);
+        // Independent of the other counters.
+        assert_eq!(back.front.feedback_count, 0);
+        assert_eq!(back.front.recall_count, 0);
+    }
+
+    /// AC3 (companion) — older markdown without `surfaced_count:` reads
+    /// back as 0. Covers the `#[serde(default)]` migration path for files
+    /// written by recall < v0.7.x.
+    #[test]
+    fn surfaced_count_defaults_when_absent_from_markdown() {
+        let mut m = Memory::new(Kind::Semantic, Subject::user(), "legacy body");
+        m.front.surfaced_count = 9;
+        let md = m.to_markdown().unwrap();
+        // Strip the field from the serialized YAML to simulate a file that
+        // predates the column. Match the whole line including trailing
+        // newline so we don't leave a blank line in the frontmatter.
+        let mut stripped = String::with_capacity(md.len());
+        for line in md.lines() {
+            if line.trim_start().starts_with("surfaced_count:") {
+                continue;
+            }
+            stripped.push_str(line);
+            stripped.push('\n');
+        }
+        let back = Memory::from_markdown(&stripped).unwrap();
+        assert_eq!(back.front.surfaced_count, 0);
     }
 }

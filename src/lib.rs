@@ -20,4 +20,5 @@ pub mod observer;
 pub mod paths;
 pub mod retrieval;
 pub mod scratch;
+pub mod session;
 pub mod store;

@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Read the persisted schema_version row. Returns None if the row is missing
 /// (which means the store predates `schema_meta`).
@@ -126,8 +126,8 @@ impl Index {
         )?;
 
         self.conn.execute(
-            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim, feedback_count, confidence_at_create)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim, feedback_count, confidence_at_create, surfaced_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind,
                subject = excluded.subject,
@@ -139,7 +139,8 @@ impl Index {
                embedding = excluded.embedding,
                embedding_id = excluded.embedding_id,
                embedding_dim = excluded.embedding_dim,
-               feedback_count = excluded.feedback_count",
+               feedback_count = excluded.feedback_count,
+               surfaced_count = excluded.surfaced_count",
             params![
                 mem.front.id,
                 mem.front.kind.as_str(),
@@ -157,6 +158,7 @@ impl Index {
                 embed_dim,
                 mem.front.feedback_count,
                 mem.front.confidence,
+                mem.front.surfaced_count,
             ],
         )?;
         Ok(())
@@ -267,6 +269,44 @@ impl Index {
             .conn
             .query_row(
                 "SELECT feedback_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        Ok(u32::try_from(n).unwrap_or(0))
+    }
+
+    /// Increment `surfaced_count` by 1. Does NOT touch confidence and does
+    /// NOT touch `feedback_count` — surfacing is a separate signal from
+    /// accept/reject outcome feedback. Returns the new surfaced_count.
+    pub fn apply_surfaced_increment(&self, id: &str) -> Result<u32> {
+        let current: i64 = self
+            .conn
+            .query_row(
+                "SELECT surfaced_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        let new_count = current.saturating_add(1);
+        self.conn.execute(
+            "UPDATE memories_meta
+             SET surfaced_count = ?1,
+                 updated_at = ?2
+             WHERE id = ?3",
+            params![new_count, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok(u32::try_from(new_count).unwrap_or(u32::MAX))
+    }
+
+    /// Look up `surfaced_count` for a single id (used by tests + observability).
+    pub fn get_surfaced_count(&self, id: &str) -> Result<u32> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT surfaced_count FROM memories_meta WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
@@ -603,7 +643,8 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     embedding_dim INTEGER,
     feedback_count INTEGER NOT NULL DEFAULT 0,
     confidence_at_create REAL,
-    last_decay_sweep_at TEXT
+    last_decay_sweep_at TEXT,
+    surfaced_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -655,6 +696,19 @@ fn migrate(conn: &Connection) -> Result<()> {
              SET confidence_at_create = confidence
              WHERE confidence_at_create IS NULL",
             [],
+        )?;
+    }
+
+    if existing < 4 {
+        // v0.6 stores predate `surfaced_count`. Tracks hook-injected
+        // surfacings separately from `recall_count` (API-driven query
+        // touches) and `feedback_count` (accept/reject events). Backfills
+        // to 0 via the column default.
+        add_column_if_missing(
+            conn,
+            "memories_meta",
+            "surfaced_count",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
     }
 
