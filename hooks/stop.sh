@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # recall stop hook — promote within-session scratch to long-term memory,
-# record hook-surfaced events, and auto-accept recalled memories.
+# record hook-surfaced events, auto-accept recalled memories, and collect
+# use-evidence for surfaced memories.
 #
-# Stop fires when a Claude Code session ends. Three best-effort steps:
+# Stop fires when a Claude Code session ends. Four best-effort steps:
 #   1. `recall scratch write` entries graduate to indexed long-term memory.
 #   2. Surfaced increment (PRD-recall-surfaced-tracking AC6): any memory id
 #      listed in $RECALL_WEATHER_DIR/<sid>/surfaced.json gets
@@ -13,6 +14,8 @@
 #      $RECALL_WEATHER_DIR/<sid>/recalled.json (default ~/.cache/recall-weather/)
 #      gets `recall feedback --accept`'d once — a small implicit-accept
 #      bump for memories that surfaced and weren't contradicted.
+#   4. Use-detect (PRD-recall-use-evidence): scan the session transcript for
+#      n-gram and API-recall evidence; write used.json to the weather dir.
 # Silent if recall is not installed, no session id is set, or nothing
 # was scratched/recalled.
 
@@ -64,3 +67,9 @@ if [ -x "$JQ" ] && [ -f "$recalled_file" ]; then
     fi
     rm -rf "$weather_dir" 2>/dev/null || true
 fi
+
+# Step 4 — use-detect (PRD-recall-use-evidence AC8): scan the session transcript
+# and write used.json to the weather dir alongside surfaced.json.
+# Best-effort: silent on failure.
+"$RECALL_BIN" use-detect --session "$sid" --format text 2>&1 \
+    | sed 's/^/[recall] /' || true
