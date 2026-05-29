@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.10.0 — 2026-05-29
+
+Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination. Adds `surfaced.json` tracking alongside `recalled.json` in the weather dir.
+
 ## v0.9.0 — 2026-05-29
 
 Promotes temporal decay to a first-class `recall temporal-decay` subcommand with dry-run
