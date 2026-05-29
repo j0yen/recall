@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.9.0 — 2026-05-29
+
+Promotes temporal decay to a first-class `recall temporal-decay` subcommand with dry-run
+support, per-memory reporting, configurable thresholds, and a `temporal_decay` pure-function
+module. Dry-run (default) shows what would decay; `--apply` writes the changes. Accepts
+`--half-life-d`, `--min-interval-d`, `--min-delta`, `--subject`, and `--format text|json`.
+The new `Index::temporal_decay_report` method is the preferred path over the legacy
+`--decay-sweep` flag (kept for backward compat). AC1-AC6 all green.
+
 ## v0.8.0 — 2026-05-29
 
 feat: add `recall doctor --check-claims` command
