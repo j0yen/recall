@@ -155,7 +155,7 @@ subcommand (`recall session-start --emit`).
 
 ## Recent
 
-- **v0.8.0+** (surfaced-tracking): Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination.
+- **v0.10.0** (surfaced-tracking): Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination.
 
 ## Provenance
 
