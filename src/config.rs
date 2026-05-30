@@ -15,6 +15,7 @@ pub struct Config {
     pub retrieval: Retrieval,
     pub embedder: EmbedderCfg,
     pub feedback: Feedback,
+    pub vacuum: crate::vacuum::VacuumConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -433,6 +433,53 @@ impl Index {
         Ok(u32::try_from(n).unwrap_or(0))
     }
 
+    /// Query vacuum candidates: rows where
+    /// `surfaced_count >= min_surfaced AND recall_count <= max_used`.
+    ///
+    /// Returns candidates ordered by `surfaced_count DESC`.
+    pub fn vacuum_candidates(
+        &self,
+        min_surfaced: u32,
+        max_used: u32,
+    ) -> Result<Vec<crate::vacuum::VacuumCandidate>> {
+        crate::vacuum::query_candidates(&self.conn, min_surfaced, max_used)
+    }
+
+    /// Apply confidence decay to a vacuum candidate (PRD-recall-corpus-vacuum).
+    ///
+    /// Updates `memories_meta` only (the caller mirrors to markdown).
+    /// Returns the new confidence.
+    pub fn vacuum_apply_decay_sql(
+        &self,
+        id: &str,
+        confidence_before: f64,
+        decay_amount: f64,
+    ) -> Result<f64> {
+        let new_conf = (confidence_before - decay_amount).max(0.05);
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE memories_meta
+             SET confidence = ?1, updated_at = ?2
+             WHERE id = ?3",
+            params![new_conf, now, id],
+        )?;
+        Ok(new_conf)
+    }
+
+    /// Archive a vacuum candidate: remove its row from `memories_meta` and FTS5.
+    /// The caller is responsible for moving the file on disk first.
+    pub fn vacuum_remove(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM memories_meta WHERE id = ?1",
+            params![id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM memories_fts WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// List `(id, drift)` for memories whose confidence has moved
     /// `>= threshold` from `confidence_at_create`. Used by `recall doctor`.
     pub fn confidence_drift(&self, threshold: f64) -> Result<Vec<(String, f64)>> {

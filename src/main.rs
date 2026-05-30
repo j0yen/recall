@@ -421,6 +421,38 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+
+    /// Sweep low-utility-high-surface memories and optionally apply actions.
+    ///
+    /// Default is dry-run: lists candidates without mutation. Pass `--apply`
+    /// to execute the configured action. Three actions:
+    /// - `decay` (default): reduce confidence by `decay_amount`; recoverable.
+    /// - `supersede`: write a proposal file for user review; memory unchanged.
+    /// - `archive`: move file to `memories-archive/` and remove from index.
+    ///
+    /// Threshold: `surfaced_count >= min_surfaced AND recall_count <= max_used`.
+    /// See PRD-recall-corpus-vacuum.
+    Vacuum {
+        /// List candidates without applying any action (default).
+        #[arg(long, default_value_t = true)]
+        dry_run: bool,
+        /// Actually perform the action (sets dry_run to false).
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Action to take: `decay`, `supersede`, or `archive`.
+        /// Defaults to `decay` (or `recall.toml` `vacuum.default_action`).
+        #[arg(long, value_parser = ["decay", "supersede", "archive"])]
+        action: Option<String>,
+        /// Minimum `surfaced_count` threshold (default from recall.toml, 20).
+        #[arg(long)]
+        min_surfaced: Option<u32>,
+        /// Maximum `recall_count` (used count) threshold (default from recall.toml, 0).
+        #[arg(long)]
+        max_used: Option<u32>,
+        /// Output format: `text` or `json`.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -806,6 +838,23 @@ fn main() -> Result<()> {
             subject.as_deref(),
             &format,
             embedder_kind,
+        ),
+        Command::Vacuum {
+            dry_run,
+            apply,
+            action,
+            min_surfaced,
+            max_used,
+            format,
+        } => cmd_vacuum(
+            &root,
+            &config,
+            dry_run,
+            apply,
+            action.as_deref(),
+            min_surfaced,
+            max_used,
+            &format,
         ),
     }
 }
@@ -3127,5 +3176,138 @@ fn cmd_temporal_decay(
         }
     }
 
+    Ok(())
+}
+
+/// Corpus vacuum sweep (PRD-recall-corpus-vacuum).
+///
+/// Lists candidates matching `surfaced_count >= min_surfaced AND
+/// recall_count <= max_used`, and optionally applies one of three
+/// actions: `decay` (default), `supersede`, or `archive`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_vacuum(
+    root: &std::path::Path,
+    config: &Config,
+    dry_run: bool,
+    apply: bool,
+    action_override: Option<&str>,
+    min_surfaced_override: Option<u32>,
+    max_used_override: Option<u32>,
+    format: &str,
+) -> Result<()> {
+    use recall::vacuum::{VacuumCandidate, apply_archive, apply_decay, apply_supersede_proposal};
+
+    let vcfg = &config.vacuum;
+    let do_apply = apply && !dry_run || apply;
+    let is_dry_run = !do_apply;
+    let action = action_override
+        .unwrap_or(vcfg.default_action.as_str())
+        .to_string();
+    let min_surfaced = min_surfaced_override.unwrap_or(vcfg.min_surfaced);
+    let max_used = max_used_override.unwrap_or(vcfg.max_used);
+
+    let idx = Index::open(&paths::index_db(root))?;
+    let store = FileStore::open(root.to_path_buf())?;
+
+    let mut candidates: Vec<VacuumCandidate> = idx.vacuum_candidates(min_surfaced, max_used)?;
+
+    if do_apply {
+        for c in &mut candidates {
+            match action.as_str() {
+                "decay" => {
+                    match apply_decay(&idx, &store, c, vcfg.decay_amount) {
+                        Ok(new_conf) => {
+                            c.confidence_after = new_conf;
+                            c.action_applied = Some("decay".to_string());
+                        }
+                        Err(e) => {
+                            eprintln!("vacuum decay {}: {e:#}", c.id);
+                        }
+                    }
+                }
+                "archive" => {
+                    let src_path = match store.find_by_id(&c.id) {
+                        Ok((_, p)) => p,
+                        Err(e) => {
+                            eprintln!("vacuum archive {}: find failed: {e:#}", c.id);
+                            continue;
+                        }
+                    };
+                    match apply_archive(&idx, root, c, &src_path) {
+                        Ok(()) => {
+                            c.action_applied = Some("archive".to_string());
+                        }
+                        Err(e) => {
+                            eprintln!("vacuum archive {}: {e:#}", c.id);
+                        }
+                    }
+                }
+                "supersede" => {
+                    let body_preview = match store.find_by_id(&c.id) {
+                        Ok((mem, _)) => mem.body.clone(),
+                        Err(_) => String::new(),
+                    };
+                    match apply_supersede_proposal(root, c, &body_preview) {
+                        Ok(proposal_id) => {
+                            c.action_applied = Some(format!("supersede:{proposal_id}"));
+                        }
+                        Err(e) => {
+                            eprintln!("vacuum supersede {}: {e:#}", c.id);
+                        }
+                    }
+                }
+                other => {
+                    return Err(anyhow!("unknown vacuum action: {other}"));
+                }
+            }
+        }
+    } else {
+        // Dry run: project decay values without writing.
+        if action == "decay" {
+            for c in &mut candidates {
+                c.confidence_after = (c.confidence_before - vcfg.decay_amount).max(0.05);
+            }
+        }
+    }
+
+    let result = recall::vacuum::VacuumResult {
+        candidates: candidates.len(),
+        would_apply: action.clone(),
+        dry_run: is_dry_run,
+        memories: candidates.clone(),
+    };
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if candidates.is_empty() {
+        println!(
+            "vacuum: 0 candidates (min_surfaced={min_surfaced}, max_used={max_used})"
+        );
+    } else {
+        let mode = if is_dry_run { "dry-run" } else { action.as_str() };
+        println!(
+            "vacuum {mode} ({} candidate{}):",
+            candidates.len(),
+            if candidates.len() == 1 { "" } else { "s" }
+        );
+        for c in &candidates {
+            println!(
+                "  {}  [{}/{}]  surfaced={}  used={}  conf {:.3} -> {:.3}{}",
+                c.id,
+                c.kind,
+                c.subject,
+                c.surfaced,
+                c.used,
+                c.confidence_before,
+                c.confidence_after,
+                c.action_applied
+                    .as_deref()
+                    .map_or(String::new(), |a| format!("  applied={a}")),
+            );
+        }
+        if is_dry_run {
+            println!("(pass --apply to execute {action})");
+        }
+    }
     Ok(())
 }

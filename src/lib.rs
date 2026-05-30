@@ -25,3 +25,4 @@ pub mod session;
 pub mod store;
 pub mod temporal_decay;
 pub mod use_detect;
+pub mod vacuum;

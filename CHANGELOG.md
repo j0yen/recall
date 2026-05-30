@@ -2,6 +2,21 @@
 
 ## v0.8.0 — 2026-05-29
 
+feat: add `recall vacuum` subcommand (PRD-recall-corpus-vacuum)
+
+New `recall vacuum` command sweeps low-utility-high-surface memories:
+
+- Candidates: `surfaced_count >= min_surfaced AND recall_count <= max_used` (defaults: 20, 0)
+- Default mode: dry-run (lists candidates, no writes)
+- `--apply` executes the configured action:
+  - `decay` (default): reduces confidence by `decay_amount` (0.10), floored at 0.05; recoverable
+  - `supersede`: writes a proposal file under `proposals/` for user review; memory unchanged
+  - `archive`: moves the file to `memories-archive/<kind>/` and removes the index row
+- `--min-surfaced` / `--max-used` flags override `recall.toml` thresholds
+- `recall.toml` `[vacuum]` section for defaults
+- Self-review playbook: `~/.claude/skills/self-review/playbooks/recall_corpus_vacuum.md`
+- JSON and text output formats
+
 feat: add `recall doctor --check-claims` command
 
 New `doctor_claims` module spots-checks memory body assertions against live
