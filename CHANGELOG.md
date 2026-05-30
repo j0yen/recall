@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.11.0 — 2026-05-30
+
+Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
+
 ## v0.10.0 — 2026-05-29
 
 Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination. Adds `surfaced.json` tracking alongside `recalled.json` in the weather dir.
