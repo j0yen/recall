@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.11.1 — 2026-05-30
+
+Adds a `utility` section to `recall doctor` (JSON + text) reporting
+`total_memories`, `with_surface_data` (surfaced_count >= 5), and two
+ranked buckets: `low_utility_high_surface` (ratio < 0.2, top 10 by
+surfaced_count) and `high_utility_validated` (ratio >= 0.7, top 10 by
+used_count). Each record includes `calibration_drift = confidence -
+(0.5 + ratio * 0.5)`. Pure diagnostic — no writes, no confidence
+mutation. Sets the table for `recall vacuum` (PRD #5).
+
 ## v0.11.0 — 2026-05-30
 
 Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
