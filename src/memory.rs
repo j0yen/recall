@@ -105,6 +105,12 @@ pub struct Frontmatter {
     pub feedback_count: u32,
     #[serde(default)]
     pub surfaced_count: u32,
+    /// How many sessions confirmed this memory was actually used (not just
+    /// surfaced). Set by `recall feedback --accept-used`. Separate from
+    /// `feedback_count` (any outcome) and `surfaced_count` (any surfacing).
+    /// PRD-recall-stop-hook-discriminate §2.1.
+    #[serde(default, skip_serializing_if = "crate::memory::is_zero_u32")]
+    pub used_count: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub supersedes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,6 +131,13 @@ pub struct Frontmatter {
 
 fn default_confidence() -> f64 {
     0.5
+}
+
+/// Serde skip helper: omit `used_count: 0` from the YAML frontmatter so
+/// files written before PRD-recall-stop-hook-discriminate remain clean.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A memory in memory (heh). Body is the Markdown content following the frontmatter.
@@ -150,6 +163,7 @@ impl Memory {
                 recall_count: 0,
                 feedback_count: 0,
                 surfaced_count: 0,
+                used_count: 0,
                 supersedes: Vec::new(),
                 decays_after: None,
                 written_by_session: None,

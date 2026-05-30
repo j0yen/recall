@@ -348,6 +348,13 @@ enum Command {
         /// Memories to mark as helpful (raises confidence by `accept_delta`).
         #[arg(long, value_delimiter = ' ', num_args = 0..)]
         accept: Vec<String>,
+        /// Memories confirmed as used by the Stop hook. Like `--accept`
+        /// (bumps confidence + feedback_count) AND increments `used_count`.
+        /// Use this for memories the session actually referenced; reserve
+        /// plain `--accept` for manual user-driven accepts.
+        /// PRD-recall-stop-hook-discriminate §2.2.
+        #[arg(long, value_delimiter = ' ', num_args = 0..)]
+        accept_used: Vec<String>,
         /// Memories to mark as wrong (lowers confidence by `reject_delta`).
         #[arg(long, value_delimiter = ' ', num_args = 0..)]
         reject: Vec<String>,
@@ -764,6 +771,7 @@ fn main() -> Result<()> {
         Command::Daemon { op } => cmd_daemon(op),
         Command::Feedback {
             accept,
+            accept_used,
             reject,
             abstain,
             surfaced,
@@ -774,6 +782,7 @@ fn main() -> Result<()> {
             &root,
             &config,
             accept,
+            accept_used,
             reject,
             abstain,
             surfaced,
@@ -1285,6 +1294,7 @@ fn cmd_feedback(
     root: &std::path::Path,
     config: &Config,
     accept: Vec<String>,
+    accept_used: Vec<String>,
     reject: Vec<String>,
     abstain: Vec<String>,
     surfaced: Vec<String>,
@@ -1294,13 +1304,14 @@ fn cmd_feedback(
     _embedder_kind: EmbedderKind,
 ) -> Result<()> {
     if accept.is_empty()
+        && accept_used.is_empty()
         && reject.is_empty()
         && abstain.is_empty()
         && surfaced.is_empty()
         && !decay_sweep
     {
         return Err(anyhow!(
-            "feedback requires at least one of --accept, --reject, --abstain, --surfaced, or --decay-sweep"
+            "feedback requires at least one of --accept, --accept-used, --reject, --abstain, --surfaced, or --decay-sweep"
         ));
     }
     let store = FileStore::open(root.to_path_buf())?;
@@ -1314,6 +1325,7 @@ fn cmd_feedback(
         new_confidence: Option<f64>,
         feedback_count: Option<u32>,
         surfaced_count: Option<u32>,
+        used_count: Option<u32>,
         error: Option<String>,
     }
 
@@ -1336,6 +1348,7 @@ fn cmd_feedback(
                 new_confidence: Some(conf),
                 feedback_count: Some(n),
                 surfaced_count: None,
+                used_count: None,
                 error: None,
             }),
             Err(e) => results.push(Outcome {
@@ -1344,6 +1357,33 @@ fn cmd_feedback(
                 new_confidence: None,
                 feedback_count: None,
                 surfaced_count: None,
+                used_count: None,
+                error: Some(format!("{e:#}")),
+            }),
+        }
+    }
+
+    // accept-used = +accept_delta + used_count++ + feedback_count++.
+    // PRD-recall-stop-hook-discriminate §2.2: Stop hook uses this path
+    // for memories confirmed as actually used in the session.
+    for id in accept_used {
+        match apply_used_feedback_one(&store, &idx, &id, cfg) {
+            Ok((conf, fc, uc)) => results.push(Outcome {
+                id,
+                op: "accept-used",
+                new_confidence: Some(conf),
+                feedback_count: Some(fc),
+                surfaced_count: None,
+                used_count: Some(uc),
+                error: None,
+            }),
+            Err(e) => results.push(Outcome {
+                id,
+                op: "accept-used",
+                new_confidence: None,
+                feedback_count: None,
+                surfaced_count: None,
+                used_count: None,
                 error: Some(format!("{e:#}")),
             }),
         }
@@ -1360,6 +1400,7 @@ fn cmd_feedback(
                 new_confidence: None,
                 feedback_count: None,
                 surfaced_count: Some(n),
+                used_count: None,
                 error: None,
             }),
             Err(e) => results.push(Outcome {
@@ -1368,6 +1409,7 @@ fn cmd_feedback(
                 new_confidence: None,
                 feedback_count: None,
                 surfaced_count: None,
+                used_count: None,
                 error: Some(format!("{e:#}")),
             }),
         }
@@ -1389,6 +1431,7 @@ fn cmd_feedback(
                     "confidence": o.new_confidence,
                     "feedback_count": o.feedback_count,
                     "surfaced_count": o.surfaced_count,
+                    "used_count": o.used_count,
                     "error": o.error,
                 })
             })
@@ -1401,13 +1444,26 @@ fn cmd_feedback(
     } else {
         for o in &results {
             match (&o.new_confidence, &o.surfaced_count, &o.error) {
-                (Some(c), _, _) => println!(
-                    "{}  {}  conf={:.3}  feedback_count={}",
-                    o.id,
-                    o.op,
-                    c,
-                    o.feedback_count.unwrap_or(0)
-                ),
+                (Some(c), _, _) => {
+                    if let Some(uc) = o.used_count {
+                        println!(
+                            "{}  {}  conf={:.3}  feedback_count={}  used_count={}",
+                            o.id,
+                            o.op,
+                            c,
+                            o.feedback_count.unwrap_or(0),
+                            uc
+                        );
+                    } else {
+                        println!(
+                            "{}  {}  conf={:.3}  feedback_count={}",
+                            o.id,
+                            o.op,
+                            c,
+                            o.feedback_count.unwrap_or(0)
+                        );
+                    }
+                }
                 (None, Some(n), _) => println!(
                     "{}  {}  surfaced_count={}",
                     o.id, o.op, n,
@@ -1438,6 +1494,25 @@ fn apply_feedback_one(
     mem.front.updated_at = Some(Utc::now());
     store.overwrite(&path, &mem)?;
     Ok((new_conf, new_count))
+}
+
+/// `--accept-used` path: bumps confidence + feedback_count + used_count.
+/// PRD-recall-stop-hook-discriminate §2.2.
+fn apply_used_feedback_one(
+    store: &FileStore,
+    idx: &Index,
+    id: &str,
+    cfg: &recall::config::Feedback,
+) -> Result<(f64, u32, u32)> {
+    let (new_conf, new_fc, new_uc) = idx.apply_used_feedback(id, cfg)?;
+    // Mirror to the markdown file so the file stays the source of truth.
+    let (mut mem, path) = store.find_by_id(id)?;
+    mem.front.confidence = new_conf;
+    mem.front.feedback_count = new_fc;
+    mem.front.used_count = new_uc;
+    mem.front.updated_at = Some(Utc::now());
+    store.overwrite(&path, &mem)?;
+    Ok((new_conf, new_fc, new_uc))
 }
 
 fn apply_surfaced_one(store: &FileStore, idx: &Index, id: &str) -> Result<u32> {
