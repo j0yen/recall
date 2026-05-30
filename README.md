@@ -155,6 +155,7 @@ subcommand (`recall session-start --emit`).
 
 ## Recent
 
+- **v0.11.0** (stop-hook-discriminate): Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column, `recall feedback --accept-used` flag, and rewrites `hooks/stop.sh` to apply `--accept-used` on used ids and `--abstain` on surfaced-but-unused ids.
 - **v0.10.0** (surfaced-tracking): Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination.
 
 ## Provenance
