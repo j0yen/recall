@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use recall::config::Config;
 use recall::daemon;
 use recall::doctor_claims::{check_claims, CheckClaimsOpts};
+use recall::doctor_utility;
 use recall::embeddings::EmbedderKind;
 use recall::index::{Index, MetaRow};
 use recall::memory::{Evidence, Kind, Memory, Subject};
@@ -2234,6 +2235,9 @@ fn cmd_doctor(
         .map(|(id, d)| serde_json::json!({ "id": id, "drift": d }))
         .collect();
 
+    // ── Utility report (PRD-recall-doctor-utility) ───────────────────────────
+    let utility_report = doctor_utility::compute_utility_report(&paths::index_db(root))?;
+
     if format == "json" {
         let obj = serde_json::json!({
             "files_on_disk": on_disk.len(),
@@ -2255,6 +2259,7 @@ fn cmd_doctor(
             "daemon_active": daemon_active,
             "daemon_uptime_s": daemon_uptime_s,
             "confidence_drift": drift_json,
+            "utility": utility_report,
         });
         println!("{}", serde_json::to_string_pretty(&obj)?);
     } else {
@@ -2308,6 +2313,9 @@ fn cmd_doctor(
                 embedder_mismatch.iter().map(|_| ()).count()
             );
         }
+        // ── Utility text block ───────────────────────────────────────────────
+        println!();
+        doctor_utility::print_utility_text(&utility_report);
     }
 
     // ── check-claims mode ────────────────────────────────────────────────────
