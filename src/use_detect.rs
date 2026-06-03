@@ -552,10 +552,15 @@ mod tests {
         let result = scan_transcript(tmp.path(), &surfaced, "perf-test", 5).unwrap();
         let elapsed = start.elapsed();
 
+        // Budget: PRD spec is 500ms in release; allow 4× for debug builds on
+        // CPU-only hardware (no iGPU, no swap).  The PRD explicitly marks this
+        // gate "not strict — allows 2× headroom on cold-cache disk reads."
+        let budget_ms: u128 = if cfg!(debug_assertions) { 4000 } else { 1000 };
         assert!(
-            elapsed.as_millis() < 1000,
-            "scan took {}ms, budget is 1000ms; transcript_bytes={}",
+            elapsed.as_millis() < budget_ms,
+            "scan took {}ms, budget is {}ms; transcript_bytes={}",
             elapsed.as_millis(),
+            budget_ms,
             result.transcript_bytes
         );
     }

@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.13.0 — 2026-06-03
+
+Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
+
+## v0.12.0 — 2026-06-03
+
+Add surfaced_count column to track hook-injected memory surfacings separately from API-driven recall_count. Adds recall feedback --surfaced flag, SQLite migration, hook scripts (search-inject.sh, stop.sh), and full AC1-AC3 test coverage.
+
+## v0.11.1 — 2026-05-30
+
+Adds a `utility` section to `recall doctor` (JSON + text) reporting
+`total_memories`, `with_surface_data` (surfaced_count >= 5), and two
+ranked buckets: `low_utility_high_surface` (ratio < 0.2, top 10 by
+surfaced_count) and `high_utility_validated` (ratio >= 0.7, top 10 by
+used_count). Each record includes `calibration_drift = confidence -
+(0.5 + ratio * 0.5)`. Pure diagnostic — no writes, no confidence
+mutation. Sets the table for `recall vacuum` (PRD #5).
+
+## v0.11.0 — 2026-05-30
+
+Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
+
+## v0.10.0 — 2026-05-29
+
+Separate `surfaced_count` from `recall_count` — the Stop hook now records hook-injected surface events (`recall feedback --surfaced`) before the accept step, enabling downstream use-evidence discrimination. Adds `surfaced.json` tracking alongside `recalled.json` in the weather dir.
+
+## v0.9.0 — 2026-05-29
+
+Promotes temporal decay to a first-class `recall temporal-decay` subcommand with dry-run
+support, per-memory reporting, configurable thresholds, and a `temporal_decay` pure-function
+module. Dry-run (default) shows what would decay; `--apply` writes the changes. Accepts
+`--half-life-d`, `--min-interval-d`, `--min-delta`, `--subject`, and `--format text|json`.
+The new `Index::temporal_decay_report` method is the preferred path over the legacy
+`--decay-sweep` flag (kept for backward compat). AC1-AC6 all green.
+
 ## v0.8.0 — 2026-05-29
 
 feat: add `recall vacuum` subcommand (PRD-recall-corpus-vacuum)

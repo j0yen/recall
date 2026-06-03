@@ -13,6 +13,7 @@
 pub mod config;
 pub mod daemon;
 pub mod doctor_claims;
+pub mod doctor_utility;
 pub mod embeddings;
 pub mod feedback;
 pub mod index;
