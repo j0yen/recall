@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.12.0 — 2026-06-03
+
+Add surfaced_count column to track hook-injected memory surfacings separately from API-driven recall_count. Adds recall feedback --surfaced flag, SQLite migration, hook scripts (search-inject.sh, stop.sh), and full AC1-AC3 test coverage.
+
 ## v0.11.1 — 2026-05-30
 
 Adds a `utility` section to `recall doctor` (JSON + text) reporting
