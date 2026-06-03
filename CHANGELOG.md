@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.14.0 — 2026-06-03
+
+The doctor exposes high-surface-low-use memories; this PRD acts on
+them. `recall vacuum` is a sweep that, by default, lists candidate
+ids matching `surfaced_count >= 20 AND used_count == 0` (the
+pure-noise corpus). With `--apply` it executes one of three
+configurable actions: aggressive decay (`confidence -= 0.10`),
+supersede-proposal (writes under `~/.claude/recall/proposals/` for
+user review, same surface braid uses), or archive (moves the file
+to `memories-archive/`). Default action: decay. Plus a self-review
+playbook entry that runs `recall vacuum --dry-run` weekly and
+surfaces the count. Last PRD of the fidelity vision; closes the
+loop from "measure utility" to "act on it."
+---
+
 ## v0.13.0 — 2026-06-03
 
 Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
