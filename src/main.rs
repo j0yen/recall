@@ -567,6 +567,9 @@ fn resolve_session_filter(
 }
 
 fn main() -> Result<()> {
+    // Restore SIG_DFL for SIGPIPE: a closed pipe reader should exit us quietly
+    // (status 141), not make `println!` return EPIPE → panic → abort → coredump.
+    sigpipe::reset();
     let cli = Cli::parse();
     let root = match cli.root {
         Some(r) => r,
