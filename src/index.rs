@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Read the persisted schema_version row. Returns None if the row is missing
 /// (which means the store predates `schema_meta`).
@@ -126,8 +126,8 @@ impl Index {
         )?;
 
         self.conn.execute(
-            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim, feedback_count, confidence_at_create, surfaced_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "INSERT INTO memories_meta (id, kind, subject, path, confidence, created_at, updated_at, last_recalled_at, recall_count, decays_after, supersedes_json, embedding, embedding_id, embedding_dim, feedback_count, confidence_at_create, surfaced_count, used_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
              ON CONFLICT(id) DO UPDATE SET
                kind = excluded.kind,
                subject = excluded.subject,
@@ -140,7 +140,8 @@ impl Index {
                embedding_id = excluded.embedding_id,
                embedding_dim = excluded.embedding_dim,
                feedback_count = excluded.feedback_count,
-               surfaced_count = excluded.surfaced_count",
+               surfaced_count = excluded.surfaced_count,
+               used_count = excluded.used_count",
             params![
                 mem.front.id,
                 mem.front.kind.as_str(),
@@ -159,6 +160,7 @@ impl Index {
                 mem.front.feedback_count,
                 mem.front.confidence,
                 mem.front.surfaced_count,
+                mem.front.used_count,
             ],
         )?;
         Ok(())
@@ -425,6 +427,60 @@ impl Index {
             .conn
             .query_row(
                 "SELECT surfaced_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        Ok(u32::try_from(n).unwrap_or(0))
+    }
+
+    /// Increment `used_count` by 1 AND bump confidence by `accept_delta` AND
+    /// increment `feedback_count`. This is the `--accept-used` path: it
+    /// records that a memory was both surfaced and confirmed as useful.
+    ///
+    /// Returns the new `(confidence, feedback_count, used_count)` triple.
+    /// PRD-recall-stop-hook-discriminate §2.2.
+    pub fn apply_used_feedback(
+        &self,
+        id: &str,
+        cfg: &crate::config::Feedback,
+    ) -> Result<(f64, u32, u32)> {
+        let (current_conf, current_fc, current_uc): (f64, i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT confidence, feedback_count, used_count FROM memories_meta WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("memory id {id} not found"))?;
+        let new_conf = crate::feedback::apply_delta(current_conf, cfg.accept_delta, cfg);
+        let new_fc = current_fc.saturating_add(1);
+        let new_uc = current_uc.saturating_add(1);
+        self.conn.execute(
+            "UPDATE memories_meta
+             SET confidence = ?1,
+                 feedback_count = ?2,
+                 used_count = ?3,
+                 updated_at = ?4
+             WHERE id = ?5",
+            params![new_conf, new_fc, new_uc, Utc::now().to_rfc3339(), id],
+        )?;
+        Ok((
+            new_conf,
+            u32::try_from(new_fc).unwrap_or(u32::MAX),
+            u32::try_from(new_uc).unwrap_or(u32::MAX),
+        ))
+    }
+
+    /// Look up `used_count` for a single id (used by tests + observability).
+    /// PRD-recall-stop-hook-discriminate §2.1.
+    pub fn get_used_count(&self, id: &str) -> Result<u32> {
+        let n: i64 = self
+            .conn
+            .query_row(
+                "SELECT used_count FROM memories_meta WHERE id = ?1",
                 params![id],
                 |r| r.get(0),
             )
@@ -762,7 +818,8 @@ CREATE TABLE IF NOT EXISTS memories_meta (
     feedback_count INTEGER NOT NULL DEFAULT 0,
     confidence_at_create REAL,
     last_decay_sweep_at TEXT,
-    surfaced_count INTEGER NOT NULL DEFAULT 0
+    surfaced_count INTEGER NOT NULL DEFAULT 0,
+    used_count INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -826,6 +883,19 @@ fn migrate(conn: &Connection) -> Result<()> {
             conn,
             "memories_meta",
             "surfaced_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+
+    if existing < 5 {
+        // v0.7.3 stores predate `used_count`. Tracks sessions that confirmed
+        // a memory was actually used (accept-used path). Distinct from
+        // `surfaced_count` (any surfacing) and `feedback_count` (any feedback).
+        // PRD-recall-stop-hook-discriminate §2.1.
+        add_column_if_missing(
+            conn,
+            "memories_meta",
+            "used_count",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
     }
