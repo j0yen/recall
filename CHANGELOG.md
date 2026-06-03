@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.13.0 — 2026-06-03
+
+Discriminate accepted-used vs surfaced-but-unused memories in the Stop hook. Adds `used_count` column to `memories_meta`, a new `recall feedback --accept-used` flag that increments both `used_count` and `feedback_count`, and rewrites `hooks/stop.sh` to apply `--accept-used` on ids in `used.json` and `--abstain` on surfaced-but-unused ids. Legacy fallback to blanket-accept when only `recalled.json` exists. AC1–AC8 all green.
+
 ## v0.12.0 — 2026-06-03
 
 Add surfaced_count column to track hook-injected memory surfacings separately from API-driven recall_count. Adds recall feedback --surfaced flag, SQLite migration, hook scripts (search-inject.sh, stop.sh), and full AC1-AC3 test coverage.
