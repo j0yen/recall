@@ -461,6 +461,27 @@ enum Command {
         #[arg(long, default_value = "text")]
         format: String,
     },
+
+    /// Find near-duplicate memories by cosine similarity (dry-run, never writes).
+    ///
+    /// Loads all memories with stored embeddings, computes pairwise cosine
+    /// similarity (dot product; embeddings are L2-normalized), groups pairs
+    /// above `--threshold` into clusters, and prints the clusters with IDs,
+    /// subjects, similarity score, and a recommended action.
+    ///
+    /// See PRD-recall-memdedup.
+    Dedup {
+        /// Cosine-similarity threshold; pairs above this are considered duplicates
+        /// (default 0.92).
+        #[arg(long, default_value_t = 0.92)]
+        threshold: f64,
+        /// Only report clusters with at least this many members (default 2).
+        #[arg(long, default_value_t = 2)]
+        min_cluster: usize,
+        /// Emit structured JSON with a `clusters` array instead of human-readable text.
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -869,6 +890,11 @@ fn main() -> Result<()> {
             max_used,
             &format,
         ),
+        Command::Dedup {
+            threshold,
+            min_cluster,
+            json,
+        } => cmd_dedup(&root, threshold, min_cluster, json),
     }
 }
 
@@ -3396,4 +3422,22 @@ fn cmd_vacuum(
         }
     }
     Ok(())
+}
+
+/// `recall dedup` — find near-duplicate memories by cosine similarity.
+///
+/// Dry-run only; never writes to the database.
+fn cmd_dedup(
+    root: &std::path::Path,
+    threshold: f64,
+    min_cluster: usize,
+    json: bool,
+) -> Result<()> {
+    let opts = recall::dedup::DedupOpts {
+        threshold,
+        min_cluster,
+        json,
+    };
+    let result = recall::dedup::run_dedup(root, &opts)?;
+    recall::dedup::render_result(&result, &opts)
 }

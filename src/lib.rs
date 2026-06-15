@@ -12,6 +12,7 @@
 
 pub mod config;
 pub mod daemon;
+pub mod dedup;
 pub mod doctor_claims;
 pub mod doctor_utility;
 pub mod embeddings;

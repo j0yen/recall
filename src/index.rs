@@ -837,6 +837,35 @@ impl Index {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Fetch all memories that have a stored embedding.
+    ///
+    /// Returns `(id, kind, subject, embedding)` tuples. Used by `recall dedup`.
+    pub fn get_all_embeddings(&self) -> Result<Vec<(String, String, String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, subject, embedding
+             FROM memories_meta
+             WHERE embedding IS NOT NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                let blob: Vec<u8> = row.get(3)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    blob,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("fetch all embeddings")?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, subject, blob)| {
+                (id, kind, subject, crate::embeddings::unpack(&blob))
+            })
+            .collect())
+    }
 }
 
 const SCHEMA: &str = r"

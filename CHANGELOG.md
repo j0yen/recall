@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.15.0 — 2026-06-15
+
+Adds `recall dedup` subcommand for finding near-duplicate memories by cosine
+similarity. Loads all memories with stored embeddings from the SQLite index,
+computes pairwise cosine similarity (dot product over L2-normalized vectors),
+groups pairs above a configurable threshold (default 0.92) into clusters using
+union-find, and reports the clusters with IDs, subjects, kinds, similarity
+score, and a recommended action (`merge-into-newest`, `keep-highest-confidence`,
+or `review-manually`). `--threshold`, `--min-cluster`, and `--json` flags
+supported. Dry-run only — never writes to the database. Adds
+`Index::get_all_embeddings()` to the library API. AC1-AC7 all green.
+
+---
+
 ## v0.14.0 — 2026-06-03
 
 The doctor exposes high-surface-low-use memories; this PRD acts on
